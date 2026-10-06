@@ -35,7 +35,7 @@ test("the publisher selects all safe variants and never selects no-touch", () =>
   artifacts.push(artifact(`firmware-no-touch-pqc-${sha}`, 101));
 
   const selected = selectArtifacts(artifacts);
-  assert.equal(selected.size, 20);
+  assert.equal(selected.size, 21);
   assert.equal([...selected.keys()].some((variant) => variant.startsWith("no-touch")), false);
 });
 

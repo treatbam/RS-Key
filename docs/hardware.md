@@ -18,7 +18,7 @@ the short version.
 </tr>
 <tr>
 <td align="center"><b>RP2350-One</b><br>reference · USB-A<br>WS2812 on GPIO16</td>
-<td align="center"><b>RP2350-Zero</b><br>mini stick · USB-C</td>
+<td align="center"><b>RP2350-Zero</b><br>mini stick · USB-C<br>(+ ILI9341 touch panel, <a href="#ili9341--xpt2046-on-an-rp2350-zero">below</a>)</td>
 <td align="center"><b>TenStar RP2350-USB</b><br>USB-A stick<br>WS2812 on GP22</td>
 <td align="center"><b>RP2350-Touch-LCD-2.8</b><br>trusted display · 2.8″ LCD</td>
 </tr>
@@ -85,6 +85,84 @@ lean `none` build and for the out-of-the-box default.
 
 Most RP2350A boards work with at most a one-line change. Everything else
 (USB descriptors, applets, flash layout) is board-independent.
+
+## ILI9341 + XPT2046 on an RP2350-Zero
+
+**Experimental.** The [trusted-display](guides/display.md) flavor also runs on
+hand-wired parts: a **Waveshare RP2350-Zero** (4 MB) and a common 2.4″ 240×320
+**ILI9341** SPI module with an **XPT2046** resistive touch controller (the red-PCB
+"2.4 inch SPI TFT with touch" kind). The panel is the same resolution as the
+RP2350-Touch-LCD-2.8, so every screen is reused unchanged. It is opt-in: the
+default image and the 2.8″ flavor are unaffected.
+
+```sh
+env BOARD=waveshare-zero-ili9341 cargo build --release -p firmware --features display
+scripts/pt.sh target/thumbv8m.main-none-eabihf/release/firmware firmware-pt.elf
+picotool uf2 convert firmware-pt.elf -t elf firmware.uf2
+```
+
+`BOARD=waveshare-zero-ili9341` is shorthand for `DISPLAY_PANEL=ili9341` plus the
+pins below; `DISPLAY_PANEL=ili9341` alone gets the same defaults. (The knob is not
+named `DISPLAY`: that is the X11 variable every Linux desktop session exports.)
+
+| Signal | RP2350-Zero | Module pin | Notes |
+|---|---|---|---|
+| SPI0 SCK | GP2 | `SCK` + `T_CLK` | shared bus, fixed |
+| SPI0 MOSI | GP3 | `SDI (MOSI)` + `T_DIN` | shared bus, fixed |
+| SPI0 MISO | GP4 | `T_DO` (+ `SDO (MISO)`) | shared bus, fixed; the panel is never read |
+| LCD CS | GP5 | `CS` | `cs` |
+| Touch CS | GP6 | `T_CS` | `touch_cs` |
+| LCD DC | GP7 | `DC` | `dc` |
+| LCD reset | GP8 | `RESET` | `rst` |
+| Touch IRQ | GP9 | `T_IRQ` | `touch_irq`, active low, internal pull-up |
+| Backlight | GP10 | `LED` | `bl_pin`; PWM slice 5 A, active high (direct or through an N-FET) |
+| Status LED | GP16 | — | the Zero's onboard WS2812, kept as the status indicator |
+| Power | 3V3 / GND | `VCC` / `GND` | |
+
+The knob names in the last column are `[display]` keys in
+[`firmware/boards/waveshare-zero-ili9341.toml`](https://github.com/TheMaxMur/RS-Key/blob/main/firmware/boards/waveshare-zero-ili9341.toml);
+copy the file to rewire. The SPI0 pins are fixed. The backlight must be a channel-A
+GPIO among 6/8/10/12/14 so it gets a PWM slice of its own, and every pin is checked
+against the others, the LED pins and the wake button at compile time. User presence
+is the on-screen Approve, as on the 2.8″ board — BOOTSEL is not read on a display
+build. There is no wake button by default — a tap wakes the panel from display
+sleep — but `WAKE_PIN=<gpio>` can add one (active low unless `WAKE_ACTIVE_HIGH=1`).
+
+What differs from the 2.8″ board:
+
+- **Hardware SPI, shared.** Panel and touch sit on one SPI0 bus. The panel runs
+  at 37.5 MHz (the 40 MHz request rounded to `clk_peri`/4) with DMA; each touch
+  read re-clocks the bus to 2 MHz (the XPT2046 tops out at 2.5 MHz) and restores
+  it. A full-screen redraw takes about twice as long as on the 2.8″ board's
+  80 MHz PIO link. In exchange the chip stays at the stock 150 MHz: this flavor
+  sets no overclock.
+- **Panel orientation and colour.** Most ILI9341 modules want BGR order, no
+  inversion and the MADCTL column mirror for an upright portrait image —
+  `color_order = "bgr"`, `invert_colors = false`, `mirror_x = true`. A module that
+  comes up mirrored or with red and blue swapped needs those flipped.
+- **Resistive touch.** A read happens only while `T_IRQ` is low. It takes a
+  pressure pair and five samples per axis, uses the median, and drops a press that
+  is too light or a burst that spreads more than a few pixels. A contact counts
+  once two reads in a row agree. Press with a fingernail or stylus. A resting palm
+  or a light brush is not a tap.
+- **Calibration is build-time.** `touch_x_min`/`touch_x_max`/`touch_y_min`/
+  `touch_y_max` give the raw 12-bit reading at the panel's left/right/top/bottom
+  edge; a `min` above its `max` flips the axis, and `touch_swap_xy = true` swaps
+  the axes. The defaults (`3800`/`300`/`300`/`3800`, no swap) fit the common
+  module under the default orientation. If taps land mirrored, swap that axis's
+  `min` and `max`; if horizontal taps move vertically, set `touch_swap_xy`. There
+  is **no on-device calibration screen and no raw-value readout yet**. To measure
+  a module, read its corners with any XPT2046 test sketch and put the numbers in
+  the board file.
+
+> ⚠️ **Hand-wired means the wires are part of the trusted display.** The ceremony
+> rests on "a tap on a screen showing the true relying party". With the bus on
+> loose jumpers, anyone who can reach them can inject a touch (driving `T_IRQ` and
+> `MISO` fakes an Approve), repaint the panel over `MOSI`, or read PIN-pad taps off
+> `MISO`, since the touch coordinates cross the bus in the clear. The 2.8″ board
+> keeps those traces on its PCB. Physical attacks are outside the
+> [threat model](threat-model.md), but this build makes them cheaper: keep it in a
+> closed case.
 
 ## Enclosures
 
