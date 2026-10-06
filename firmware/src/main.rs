@@ -25,7 +25,10 @@ use embassy_rp::pio::InterruptHandler as PioIrq;
 // from the phy record (PicoForge); a `none` build pulls in none of them. DMA_CH0
 // and the PIO0/DMA IRQs stay bound unconditionally (the type is used by
 // `bind_interrupts!` below — harmless when no backend uses it).
-#[cfg(any(feature = "display", not(led_kind = "none")))]
+#[cfg(any(
+    all(feature = "display", display_panel = "st7789"),
+    not(led_kind = "none")
+))]
 use embassy_rp::pio::Pio;
 #[cfg(not(led_kind = "none"))]
 use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
@@ -63,7 +66,8 @@ mod worker;
 // backlight sits on GPIO16 — the default addressable-LED pin. So the panel and the
 // LED can't coexist: the flavor must be built `LED_KIND=none` (which also frees
 // GPIO16). Fail loudly at compile time rather than silently double-claim the pin.
-#[cfg(all(feature = "display", not(led_kind = "none")))]
+// The ILI9341 build keeps the LED: its backlight is elsewhere and its bus is SPI0.
+#[cfg(all(feature = "display", display_panel = "st7789", not(led_kind = "none")))]
 compile_error!(
     "the `display` build requires LED_KIND=none (the ST7789 panel replaces the LED \
      and its backlight uses GPIO16); build with `LED_KIND=none ... --features \
@@ -89,9 +93,19 @@ const HEAP_SIZE: usize = 128 * 1024;
 #[used]
 static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::secure_exe();
 
+#[cfg(not(all(feature = "display", display_panel = "ili9341")))]
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioIrq<PIO0>;
     DMA_IRQ_0 => DmaIrq<DMA_CH0>;
+    USBCTRL_IRQ => UsbIrq<USB>;
+    TRNG_IRQ => TrngIrq<TRNG>;
+});
+// The ILI9341 build's panel + touch share hardware SPI0, whose TX/RX DMA channels
+// (1/2) sit beside the LED's channel 0 on the same IRQ line.
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => PioIrq<PIO0>;
+    DMA_IRQ_0 => DmaIrq<DMA_CH0>, DmaIrq<embassy_rp::peripherals::DMA_CH1>, DmaIrq<embassy_rp::peripherals::DMA_CH2>;
     USBCTRL_IRQ => UsbIrq<USB>;
     TRNG_IRQ => TrngIrq<TRNG>;
 });
@@ -171,7 +185,9 @@ const BUILD_LED_POWER_ENABLED: bool = env_u16(env!("PK_LED_POWER_ENABLED")) != 0
 #[cfg(not(led_kind = "none"))]
 const BUILD_LED_POWER_PIN: u8 = env_u16(env!("PK_LED_POWER_PIN")) as u8;
 const BUILD_PRESENCE_IS_GPIO: bool = env_u16(env!("PK_PRESENCE_IS_GPIO")) != 0;
-#[cfg(not(feature = "display"))]
+// The LED block's collision checks read it too, and the ILI9341 display build
+// keeps an LED (its `PRESENCE_PIN` is still rejected, so the value is unused there).
+#[cfg(any(not(feature = "display"), not(led_kind = "none")))]
 const BUILD_PRESENCE_PIN: u8 = env_u16(env!("PK_PRESENCE_PIN")) as u8;
 #[cfg(not(feature = "display"))]
 const BUILD_PRESENCE_ACTIVE_HIGH: bool = env_u16(env!("PK_PRESENCE_ACTIVE_HIGH")) != 0;
@@ -207,7 +223,7 @@ const BUILD_WAKE_ACTIVE_HIGH: bool = env_u16(env!("PK_WAKE_ACTIVE_HIGH")) != 0;
 
 // The wake button must not collide with the LCD/touch GPIOs (10..=18) the display build
 // already drives — catch a bad `WAKE_PIN` at compile time rather than double-claim a pad.
-#[cfg(feature = "display")]
+#[cfg(all(feature = "display", display_panel = "st7789"))]
 const _: () = assert!(
     !BUILD_WAKE_ENABLED || BUILD_WAKE_PIN < 10 || BUILD_WAKE_PIN > 18,
     "WAKE_PIN collides with an LCD/touch GPIO (10..=18) owned by the display build"
@@ -221,10 +237,10 @@ const BUILD_DISPLAY_SPI_FREQ_HZ: u32 = env_u32(env!("PK_DISPLAY_SPI_FREQ_HZ"));
 /// divider to be 1 — which is what puts this above the RP2350's rated 150 MHz. The
 /// trade is written down in docs/limitations.md; the const assert below is what stops
 /// a board file from moving one half of it without the other.
-#[cfg(feature = "display")]
+#[cfg(all(feature = "display", display_panel = "st7789"))]
 const BUILD_DISPLAY_SYS_CLOCK_HZ: u32 = 160_000_000;
 
-#[cfg(feature = "display")]
+#[cfg(all(feature = "display", display_panel = "st7789"))]
 const _: () = assert!(
     BUILD_DISPLAY_SYS_CLOCK_HZ == BUILD_DISPLAY_SPI_FREQ_HZ * 2,
     "display.spi_freq_hz must be exactly half the system clock: the PIO emits one bit \
@@ -242,30 +258,73 @@ const BUILD_DISPLAY_BL_PIN: u8 = env_u16(env!("PK_DISPLAY_BL_PIN")) as u8;
 const BUILD_DISPLAY_BL_PWM_SLICE: u8 = env_u16(env!("PK_DISPLAY_BL_PWM_SLICE")) as u8;
 #[cfg(feature = "display")]
 const BUILD_DISPLAY_BL_PWM_CHANNEL: u8 = env_u16(env!("PK_DISPLAY_BL_PWM_CHANNEL")) as u8;
-#[cfg(feature = "display")]
+#[cfg(all(feature = "display", display_panel = "st7789"))]
 const BUILD_DISPLAY_TP_RST: u8 = env_u16(env!("PK_DISPLAY_TP_RST")) as u8;
-#[cfg(feature = "display")]
+#[cfg(all(feature = "display", display_panel = "st7789"))]
 const BUILD_DISPLAY_I2C_FREQ_HZ: u32 = env_u32(env!("PK_DISPLAY_I2C_FREQ_HZ"));
 #[cfg(feature = "display")]
 pub(crate) const BUILD_DISPLAY_INVERT_COLORS: bool = env_u16(env!("PK_DISPLAY_INVERT_COLORS")) != 0;
 #[cfg(feature = "display")]
 pub(crate) const BUILD_DISPLAY_COLOR_ORDER: u8 = env_u16(env!("PK_DISPLAY_COLOR_ORDER")) as u8;
+#[cfg(feature = "display")]
+pub(crate) const BUILD_DISPLAY_MIRROR_X: bool = env_u16(env!("PK_DISPLAY_MIRROR_X")) != 0;
+// XPT2046 touch on the ILI9341 build: chip-select, PENIRQ, raw-ADC calibration.
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+const BUILD_DISPLAY_TOUCH_CS: u8 = env_u16(env!("PK_DISPLAY_TOUCH_CS")) as u8;
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+const BUILD_DISPLAY_TOUCH_IRQ: u8 = env_u16(env!("PK_DISPLAY_TOUCH_IRQ")) as u8;
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+pub(crate) const BUILD_DISPLAY_TOUCH_X_MIN: u16 = env_u16(env!("PK_DISPLAY_TOUCH_X_MIN"));
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+pub(crate) const BUILD_DISPLAY_TOUCH_X_MAX: u16 = env_u16(env!("PK_DISPLAY_TOUCH_X_MAX"));
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+pub(crate) const BUILD_DISPLAY_TOUCH_Y_MIN: u16 = env_u16(env!("PK_DISPLAY_TOUCH_Y_MIN"));
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+pub(crate) const BUILD_DISPLAY_TOUCH_Y_MAX: u16 = env_u16(env!("PK_DISPLAY_TOUCH_Y_MAX"));
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+pub(crate) const BUILD_DISPLAY_TOUCH_SWAP_XY: bool = env_u16(env!("PK_DISPLAY_TOUCH_SWAP_XY")) != 0;
+// A collapsed calibration window has no slope; every tap would read as no touch.
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+const _: () = assert!(
+    BUILD_DISPLAY_TOUCH_X_MIN != BUILD_DISPLAY_TOUCH_X_MAX
+        && BUILD_DISPLAY_TOUCH_Y_MIN != BUILD_DISPLAY_TOUCH_Y_MAX
+        && BUILD_DISPLAY_TOUCH_X_MIN <= 4095
+        && BUILD_DISPLAY_TOUCH_X_MAX <= 4095
+        && BUILD_DISPLAY_TOUCH_Y_MIN <= 4095
+        && BUILD_DISPLAY_TOUCH_Y_MAX <= 4095,
+    "touch calibration: each axis needs min != max, both within the 12-bit ADC range"
+);
 
 // Display control GPIOs are board-configurable and claimed via AnyPin::steal
 // (CS/DC/RST/TP_RST) or Pwm::new_output_* (BL); PIO owns 10/11 and I2C1 owns 6/7.
 // Reject a pad owned by two drivers at compile time (no runtime guard).
+#[cfg(all(feature = "display", display_panel = "st7789"))]
+const DISPLAY_CTLS: &[u8] = &[
+    BUILD_DISPLAY_CS,
+    BUILD_DISPLAY_DC,
+    BUILD_DISPLAY_RST,
+    BUILD_DISPLAY_TP_RST,
+    BUILD_DISPLAY_BL_PIN,
+];
+// Pins the panel's hard-wired PIO serial link (10/11) and I2C1 (6/7) own.
+#[cfg(all(feature = "display", display_panel = "st7789"))]
+const HW_PINS: &[u8] = &[10, 11, 6, 7];
+// The ILI9341 build: the same panel controls plus the XPT2046's CS and PENIRQ;
+// SPI0's SCK/MOSI/MISO on 2/3/4 are hard-wired.
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+const DISPLAY_CTLS: &[u8] = &[
+    BUILD_DISPLAY_CS,
+    BUILD_DISPLAY_DC,
+    BUILD_DISPLAY_RST,
+    BUILD_DISPLAY_TOUCH_CS,
+    BUILD_DISPLAY_TOUCH_IRQ,
+    BUILD_DISPLAY_BL_PIN,
+];
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+const HW_PINS: &[u8] = &[2, 3, 4];
+
 #[cfg(feature = "display")]
 const _: () = {
-    const DISPLAY_CTLS: &[u8] = &[
-        BUILD_DISPLAY_CS,
-        BUILD_DISPLAY_DC,
-        BUILD_DISPLAY_RST,
-        BUILD_DISPLAY_TP_RST,
-        BUILD_DISPLAY_BL_PIN,
-    ];
-    // Pins the panel's hard-wired PIO serial link (10/11) and I2C1 (6/7) own.
-    const HW_PINS: &[u8] = &[10, 11, 6, 7];
-
     const fn contains(hay: &[u8], needle: u8) -> bool {
         let mut i = 0;
         while i < hay.len() {
@@ -291,7 +350,7 @@ const _: () = {
     while i < DISPLAY_CTLS.len() {
         assert!(
             !contains(HW_PINS, DISPLAY_CTLS[i]),
-            "panel control GPIO overlaps hard-wired PIO/I2C1 pin 6/7/10/11"
+            "panel control GPIO overlaps a hard-wired display bus pin (PIO/I2C1 6/7/10/11, or SPI0 2/3/4)"
         );
         i += 1;
     }
@@ -328,12 +387,42 @@ const _: () = {
             }
         }
     }
+
+    // Only the ILI9341 build keeps an LED beside the panel, so its SPI pins also
+    // need clearing against the LED pins, the wake button, and the runtime-selectable
+    // pimoroni backend's fixed 18/19/20.
+    #[cfg(display_panel = "ili9341")]
+    {
+        assert!(
+            !BUILD_WAKE_ENABLED || !contains(HW_PINS, BUILD_WAKE_PIN),
+            "WAKE_PIN overlaps an SPI0 display pin (2/3/4)"
+        );
+        #[cfg(not(led_kind = "none"))]
+        {
+            assert!(
+                !contains(HW_PINS, BUILD_LED_PIN),
+                "LED_PIN overlaps an SPI0 display pin (2/3/4)"
+            );
+            assert!(
+                !BUILD_LED_POWER_ENABLED || !contains(HW_PINS, BUILD_LED_POWER_PIN),
+                "LED_POWER_PIN overlaps an SPI0 display pin (2/3/4)"
+            );
+            let mut i = 0;
+            while i < DISPLAY_CTLS.len() {
+                assert!(
+                    DISPLAY_CTLS[i] < 18 || DISPLAY_CTLS[i] > 20,
+                    "panel GPIO overlaps the pimoroni LED backend's pins 18/19/20"
+                );
+                i += 1;
+            }
+        }
+    }
 };
 
 // Backlight PWM: the only valid (pin, slice, channel) combos on the RP2350.
 // Build.rs bakes the values; catch an unsupported combo at compile time so the
 // runtime `_ => unreachable!(...)` arm below is reachable only on a typo'd build.
-#[cfg(feature = "display")]
+#[cfg(all(feature = "display", display_panel = "st7789"))]
 const _: () = assert!(
     matches!(
         (
@@ -345,6 +434,16 @@ const _: () = assert!(
     ),
     "unsupported backlight PWM config (BL_PIN, SLICE, CHANNEL) — \
      see the Pwm::new_output_* match in main.rs for the supported set"
+);
+// The ILI9341 build: a channel-A pin among GPIO 6..=14, on PWM slices 3..=7 that
+// no LED backend touches (`backlight_cfg` drives compare A only).
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+const _: () = assert!(
+    matches!(BUILD_DISPLAY_BL_PIN, 6 | 8 | 10 | 12 | 14)
+        && BUILD_DISPLAY_BL_PWM_SLICE == BUILD_DISPLAY_BL_PIN / 2
+        && BUILD_DISPLAY_BL_PWM_CHANNEL == 0,
+    "unsupported ILI9341 backlight PWM config: BL_PIN must be GPIO 6/8/10/12/14 with \
+     its own slice (pin / 2) and channel A"
 );
 
 // Optional nuisance user/status LED to hold OFF at boot (`USR_LED_PIN`): a plain
@@ -450,6 +549,9 @@ static PHY_MANUFACTURER: StaticCell<[u8; 64]> = StaticCell::new();
 /// invariant as FS/RNG above — borrows never span `.await`.
 #[cfg(feature = "display")]
 static UI: StaticCell<RefCell<display::Ui>> = StaticCell::new();
+/// SPI0, shared by the ILI9341 panel and the XPT2046 touch inside `UI`.
+#[cfg(all(feature = "display", display_panel = "ili9341"))]
+static SPI_BUS: StaticCell<display::SharedSpi> = StaticCell::new();
 
 struct SendUsb(UsbDevice<'static, Drv>);
 unsafe impl Send for SendUsb {}
@@ -522,7 +624,7 @@ async fn main(spawner: Spawner) {
     arm_stack_limit();
 
     let mut config = embassy_rp::config::Config::default();
-    #[cfg(feature = "display")]
+    #[cfg(all(feature = "display", display_panel = "st7789"))]
     {
         config.clocks = embassy_rp::clocks::ClockConfig::system_freq(BUILD_DISPLAY_SYS_CLOCK_HZ)
             .expect("the display system clock must have valid PLL parameters");
@@ -714,7 +816,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x09DA;
+    let device_release: u16 = 0x09DB;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -896,6 +998,13 @@ async fn main(spawner: Spawner) {
             .filter(|&g| !(BUILD_LED_POWER_ENABLED && g == BUILD_LED_POWER_PIN))
             .filter(|&g| !(BUILD_USR_LED_ENABLED && g == BUILD_USR_LED_PIN))
             .unwrap_or(BUILD_LED_PIN);
+        // The ILI9341 display keeps the LED, so a phy pin must also miss its pads.
+        #[cfg(all(feature = "display", display_panel = "ili9341"))]
+        let led_gpio = if DISPLAY_CTLS.contains(&led_gpio) || HW_PINS.contains(&led_gpio) {
+            BUILD_LED_PIN
+        } else {
+            led_gpio
+        };
         // PHY led_driver (1=gpio, 2=pimoroni, 3=ws2812) overrides the build kind;
         // anything else (unset, or the N/A esp32 value) keeps the build default.
         let led_driver = match phy.as_ref().and_then(|p| p.led_driver) {
@@ -1034,25 +1143,101 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "display")]
     let display_ui = {
         use embassy_rp::gpio::{Level, Output};
-        use embassy_rp::i2c::{Config as I2cConfig, I2c};
         use embassy_rp::pwm::Pwm;
 
-        let Pio {
-            mut common, sm0, ..
-        } = Pio::new(p.PIO0, Irqs);
-        let spi = display::PioDisplayTx::new(
-            &mut common,
-            sm0,
-            p.PIN_10,
-            p.PIN_11,
-            p.DMA_CH0,
-            Irqs,
-            BUILD_DISPLAY_SPI_FREQ_HZ,
-        );
+        #[cfg(display_panel = "st7789")]
+        let (spi, touch, bl) = {
+            use embassy_rp::i2c::{Config as I2cConfig, I2c};
 
-        let mut i2c_cfg = I2cConfig::default();
-        i2c_cfg.frequency = BUILD_DISPLAY_I2C_FREQ_HZ;
-        let i2c = I2c::new_blocking(p.I2C1, p.PIN_7, p.PIN_6, i2c_cfg);
+            let Pio {
+                mut common, sm0, ..
+            } = Pio::new(p.PIO0, Irqs);
+            let spi = display::PioDisplayTx::new(
+                &mut common,
+                sm0,
+                p.PIN_10,
+                p.PIN_11,
+                p.DMA_CH0,
+                Irqs,
+                BUILD_DISPLAY_SPI_FREQ_HZ,
+            );
+
+            let mut i2c_cfg = I2cConfig::default();
+            i2c_cfg.frequency = BUILD_DISPLAY_I2C_FREQ_HZ;
+            let i2c = I2c::new_blocking(p.I2C1, p.PIN_7, p.PIN_6, i2c_cfg);
+
+            // Backlight PWM — pin, slice, and channel from the board config.
+            let bl = {
+                let cfg = display::backlight_cfg(0);
+                match (
+                    BUILD_DISPLAY_BL_PIN,
+                    BUILD_DISPLAY_BL_PWM_SLICE,
+                    BUILD_DISPLAY_BL_PWM_CHANNEL,
+                ) {
+                    (16, 0, 0) => Pwm::new_output_a(p.PWM_SLICE0, p.PIN_16, cfg),
+                    (17, 0, 1) => Pwm::new_output_b(p.PWM_SLICE0, p.PIN_17, cfg),
+                    (18, 1, 0) => Pwm::new_output_a(p.PWM_SLICE1, p.PIN_18, cfg),
+                    (19, 1, 1) => Pwm::new_output_b(p.PWM_SLICE1, p.PIN_19, cfg),
+                    (20, 2, 0) => Pwm::new_output_a(p.PWM_SLICE2, p.PIN_20, cfg),
+                    (21, 2, 1) => Pwm::new_output_b(p.PWM_SLICE2, p.PIN_21, cfg),
+                    _ => {
+                        // Guarded by the const assert below — unreachable at runtime,
+                        // kept so the match stays exhaustive over (pin, slice, channel).
+                        unreachable!("unsupported backlight PWM config")
+                    }
+                }
+            };
+            let tp_rst = Output::new(
+                unsafe { embassy_rp::gpio::AnyPin::steal(BUILD_DISPLAY_TP_RST) },
+                Level::High,
+            );
+            (spi, display::TouchHw { i2c, rst: tp_rst }, bl)
+        };
+
+        // ILI9341 + XPT2046 on SPI0. The LED block above may have moved any `p.PIN_*`
+        // in its runtime pin `match`, so the bus and backlight pads are stolen — sound
+        // because the const asserts and the LED's runtime filter keep it off them.
+        #[cfg(display_panel = "ili9341")]
+        let (spi, touch, bl) = {
+            use embassy_rp::gpio::{AnyPin, Input, Pull};
+            use embassy_rp::peripherals::{
+                PIN_2, PIN_3, PIN_4, PIN_6, PIN_8, PIN_10, PIN_12, PIN_14,
+            };
+            use embassy_rp::spi::{Config as SpiConfig, Spi};
+
+            let (sck, mosi, miso, touch_cs, touch_irq) = unsafe {
+                (
+                    PIN_2::steal(),
+                    PIN_3::steal(),
+                    PIN_4::steal(),
+                    AnyPin::steal(BUILD_DISPLAY_TOUCH_CS),
+                    AnyPin::steal(BUILD_DISPLAY_TOUCH_IRQ),
+                )
+            };
+            let mut spi_cfg = SpiConfig::default();
+            spi_cfg.frequency = BUILD_DISPLAY_SPI_FREQ_HZ;
+            let spi = Spi::new(p.SPI0, sck, mosi, miso, p.DMA_CH1, p.DMA_CH2, Irqs, spi_cfg);
+            let bus: &'static display::SharedSpi =
+                SPI_BUS.init(embassy_sync::mutex::Mutex::new(spi));
+
+            let cfg = display::backlight_cfg(0);
+            let bl = unsafe {
+                match BUILD_DISPLAY_BL_PIN {
+                    6 => Pwm::new_output_a(p.PWM_SLICE3, PIN_6::steal(), cfg),
+                    8 => Pwm::new_output_a(p.PWM_SLICE4, PIN_8::steal(), cfg),
+                    10 => Pwm::new_output_a(p.PWM_SLICE5, PIN_10::steal(), cfg),
+                    12 => Pwm::new_output_a(p.PWM_SLICE6, PIN_12::steal(), cfg),
+                    // Guarded by the ILI9341 backlight const assert.
+                    _ => Pwm::new_output_a(p.PWM_SLICE7, PIN_14::steal(), cfg),
+                }
+            };
+            let touch = display::TouchHw {
+                bus,
+                cs: Output::new(touch_cs, Level::High),
+                irq: Input::new(touch_irq, Pull::Up),
+            };
+            (display::SpiDisplayTx(bus), touch, bl)
+        };
 
         let cs = Output::new(
             unsafe { embassy_rp::gpio::AnyPin::steal(BUILD_DISPLAY_CS) },
@@ -1088,32 +1273,6 @@ async fn main(spawner: Spawner) {
         } else {
             None
         };
-        // Backlight PWM — pin, slice, and channel from the board config.
-        let bl = {
-            let cfg = display::backlight_cfg(0);
-            match (
-                BUILD_DISPLAY_BL_PIN,
-                BUILD_DISPLAY_BL_PWM_SLICE,
-                BUILD_DISPLAY_BL_PWM_CHANNEL,
-            ) {
-                (16, 0, 0) => Pwm::new_output_a(p.PWM_SLICE0, p.PIN_16, cfg),
-                (17, 0, 1) => Pwm::new_output_b(p.PWM_SLICE0, p.PIN_17, cfg),
-                (18, 1, 0) => Pwm::new_output_a(p.PWM_SLICE1, p.PIN_18, cfg),
-                (19, 1, 1) => Pwm::new_output_b(p.PWM_SLICE1, p.PIN_19, cfg),
-                (20, 2, 0) => Pwm::new_output_a(p.PWM_SLICE2, p.PIN_20, cfg),
-                (21, 2, 1) => Pwm::new_output_b(p.PWM_SLICE2, p.PIN_21, cfg),
-                _ => {
-                    // Guarded by the const assert below — unreachable at runtime,
-                    // kept so the match stays exhaustive over (pin, slice, channel).
-                    unreachable!("unsupported backlight PWM config")
-                }
-            }
-        };
-        let tp_rst = Output::new(
-            unsafe { embassy_rp::gpio::AnyPin::steal(BUILD_DISPLAY_TP_RST) },
-            Level::High,
-        );
-
         let panel = display::PanelHw {
             spi,
             cs,
@@ -1121,7 +1280,6 @@ async fn main(spawner: Spawner) {
             rst,
             bl,
         };
-        let touch = display::TouchHw { i2c, rst: tp_rst };
         let info = display::DeviceInfo {
             version: device_release,
             chipid: u64::from_le_bytes(serial_id),

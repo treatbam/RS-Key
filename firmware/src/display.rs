@@ -2,7 +2,9 @@
 // Copyright (C) 2026 RS-Key contributors
 
 //! This board's trusted display: the Waveshare RP2350-Touch-LCD-2.8 (ST7789 over
-//! PIO serial output, CST328 touch over I2C1), plus the board verbs the flow asks for.
+//! PIO serial output, CST328 touch over I2C1) — or, built `DISPLAY_PANEL=ili9341`, an
+//! ILI9341 module with XPT2046 touch sharing SPI0 (`display_xpt2046.rs`) — plus the
+//! board verbs the flow asks for.
 //!
 //! The flow itself — which screen is shown when, the PIN pad, the Approve/Deny
 //! wait — is [`rsk_display`], where a host can run it against a window. What is
@@ -13,16 +15,22 @@
 use core::cell::RefCell;
 
 use embassy_rp::gpio::{Input, Output};
+#[cfg(display_panel = "st7789")]
 use embassy_rp::i2c::{Blocking as I2cBlocking, I2c};
+#[cfg(display_panel = "st7789")]
 use embassy_rp::peripherals::I2C1;
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
-use embassy_time::{Duration, Instant, block_for};
+use embassy_time::Instant;
+#[cfg(display_panel = "st7789")]
+use embassy_time::{Duration, block_for};
 use mipidsi::options::{ColorInversion, ColorOrder};
 
 extern crate alloc;
 use alloc::boxed::Box;
 
-use rsk_display::{BL_TOP, TouchPad};
+use rsk_display::BL_TOP;
+#[cfg(display_panel = "st7789")]
+use rsk_display::TouchPad;
 use rsk_rsa::RsaKey;
 
 use crate::flash_storage::FlashStorage;
@@ -30,12 +38,26 @@ use crate::handler::{FidoRng, Store};
 
 #[path = "display_panel.rs"]
 mod display_panel;
-use display_panel::Panel;
+#[cfg(display_panel = "st7789")]
 pub(crate) use display_panel::PioDisplayTx;
+#[cfg(display_panel = "st7789")]
+type PanelTx = PioDisplayTx;
+#[cfg(display_panel = "ili9341")]
+pub(crate) use display_panel::{SharedSpi, SpiDisplayTx};
+#[cfg(display_panel = "ili9341")]
+type PanelTx = SpiDisplayTx;
+type Panel = display_panel::Panel<PanelTx>;
+
+#[cfg(display_panel = "ili9341")]
+#[path = "display_xpt2046.rs"]
+mod display_xpt2046;
+#[cfg(display_panel = "ili9341")]
+pub use display_xpt2046::{Touch, TouchHw};
 
 pub use rsk_display::{DeviceInfo, DeviceKeys, UI_YIELD_FLOOR_MS, piv_ref_title};
 
 /// CST328 7-bit I2C address.
+#[cfg(display_panel = "st7789")]
 const CST328_ADDR: u16 = 0x1A;
 
 /// This board's instance of the flow.
@@ -47,16 +69,17 @@ pub type TouchPresence =
 /// The panel's SPI bus + control pins, bundled so `main` stays
 /// within embassy's argument cap when it hands the peripherals over.
 pub struct PanelHw {
-    pub spi: PioDisplayTx,
+    pub spi: PanelTx,
     pub cs: Output<'static>,
     pub dc: Output<'static>,
     pub rst: Output<'static>,
-    /// GPIO16 backlight, driven as PWM for brightness (constructed at zero duty so
-    /// the panel stays dark through init — no white flash).
+    /// The backlight (GPIO16 on the 2.8" board), driven as PWM for brightness
+    /// (constructed at zero duty so the panel stays dark through init — no white flash).
     pub bl: Pwm<'static>,
 }
 
 /// The CST328 touch controller's I2C bus + reset pin.
+#[cfg(display_panel = "st7789")]
 pub struct TouchHw {
     pub i2c: I2c<'static, I2C1, I2cBlocking>,
     pub rst: Output<'static>,
@@ -75,10 +98,12 @@ pub fn backlight_cfg(duty: u16) -> PwmConfig {
 
 /// The CST328 touch controller on I2C1. Owns only the bus; the reset pin is pulsed
 /// once during [`build`].
+#[cfg(display_panel = "st7789")]
 pub struct Touch {
     i2c: I2c<'static, I2C1, I2cBlocking>,
 }
 
+#[cfg(display_panel = "st7789")]
 impl Touch {
     /// Leave normal reporting mode set after the reset pulse — write register
     /// 0xD109 (REG_MODE_NORMAL) as a 2-byte big-endian address with no payload.
@@ -87,6 +112,7 @@ impl Touch {
     }
 }
 
+#[cfg(display_panel = "st7789")]
 impl TouchPad for Touch {
     /// Read the first finger's coordinate, if any, then clear the report so the
     /// controller serves the next one. Any I2C error reads as "no touch". The
@@ -109,11 +135,12 @@ impl TouchPad for Touch {
 
 /// The board verbs and firmware globals the flow reaches through.
 pub struct DisplayHooks {
-    /// Backlight on GPIO16, driven as PWM for brightness control and held for the
-    /// device's lifetime (dropping it disconnects the pad → black panel).
+    /// The backlight (GPIO16 on the 2.8" board), driven as PWM for brightness control
+    /// and held for the device's lifetime (dropping it disconnects the pad → black panel).
     bl: Pwm<'static>,
     // The CST328 reset (GPIO17), held so its pad isn't disconnected on drop (an
     // embassy `Output` sets funcsel = Null when dropped); never toggled after build.
+    #[cfg(display_panel = "st7789")]
     #[allow(dead_code)]
     tp_rst: Output<'static>,
     /// The display-sleep wake button (the board's BAT_PWR / a `WAKE_PIN` GPIO) paired
@@ -240,12 +267,8 @@ pub fn build(
         rst,
         bl,
     } = panel;
-    let TouchHw {
-        i2c,
-        rst: mut tp_rst,
-    } = touch;
 
-    // ST7789 240x320 portrait. Inversion and color order from board config.
+    // 240x320 portrait. Inversion, color order and mirroring from board config.
     let invert = if crate::BUILD_DISPLAY_INVERT_COLORS {
         ColorInversion::Inverted
     } else {
@@ -261,23 +284,42 @@ pub fn build(
         u64::from_le_bytes(damage_key_bytes[..8].try_into().unwrap()),
         u64::from_le_bytes(damage_key_bytes[8..].try_into().unwrap()),
     ];
-    let panel = Panel::new(spi, cs, dc, rst, damage_key, invert, color_order);
+    let panel = Panel::new(
+        spi,
+        cs,
+        dc,
+        rst,
+        damage_key,
+        invert,
+        color_order,
+        crate::BUILD_DISPLAY_MIRROR_X,
+    );
 
-    // CST328 reset pulse (high → low → high), then normal reporting mode.
-    tp_rst.set_high();
-    block_for(Duration::from_millis(10));
-    tp_rst.set_low();
-    block_for(Duration::from_millis(10));
-    tp_rst.set_high();
-    block_for(Duration::from_millis(50));
-    let mut touch = Touch { i2c };
-    touch.normal_mode();
-
-    let hooks = DisplayHooks {
-        bl,
-        tp_rst,
-        wake_btn,
+    #[cfg(display_panel = "st7789")]
+    let (touch, hooks) = {
+        let TouchHw {
+            i2c,
+            rst: mut tp_rst,
+        } = touch;
+        // CST328 reset pulse (high → low → high), then normal reporting mode.
+        tp_rst.set_high();
+        block_for(Duration::from_millis(10));
+        tp_rst.set_low();
+        block_for(Duration::from_millis(10));
+        tp_rst.set_high();
+        block_for(Duration::from_millis(50));
+        let mut touch = Touch { i2c };
+        touch.normal_mode();
+        let hooks = DisplayHooks {
+            bl,
+            tp_rst,
+            wake_btn,
+        };
+        (touch, hooks)
     };
+    #[cfg(display_panel = "ili9341")]
+    let (touch, hooks) = (Touch::new(touch), DisplayHooks { bl, wake_btn });
+
     Ui::new(panel, touch, hooks, info, fs, keys, rng)
 }
 

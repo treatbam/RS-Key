@@ -77,6 +77,16 @@ struct BoardConfig {
     display_i2c_freq_hz: Option<u32>,
     display_invert_colors: Option<bool>,
     display_color_order: Option<String>,
+    // ILI9341 + XPT2046 variant (`panel = "ili9341"`)
+    display_panel: Option<String>,
+    display_mirror_x: Option<bool>,
+    display_touch_cs: Option<u8>,
+    display_touch_irq: Option<u8>,
+    display_touch_x_min: Option<u16>,
+    display_touch_x_max: Option<u16>,
+    display_touch_y_min: Option<u16>,
+    display_touch_y_max: Option<u16>,
+    display_touch_swap_xy: Option<bool>,
 }
 
 fn read_board() -> Option<BoardConfig> {
@@ -120,6 +130,15 @@ fn parse_toml(raw: &str) -> BoardConfig {
         display_i2c_freq_hz: None,
         display_invert_colors: None,
         display_color_order: None,
+        display_panel: None,
+        display_mirror_x: None,
+        display_touch_cs: None,
+        display_touch_irq: None,
+        display_touch_x_min: None,
+        display_touch_x_max: None,
+        display_touch_y_min: None,
+        display_touch_y_max: None,
+        display_touch_swap_xy: None,
     };
     let mut sec = "";
     fn strip_comment(s: &str) -> &str {
@@ -155,6 +174,11 @@ fn parse_toml(raw: &str) -> BoardConfig {
             if clean.starts_with("0x") { 16 } else { 10 },
         )
         .unwrap_or_else(|_| panic!("bad u32: {}", s))
+    }
+    fn u16(s: &str) -> u16 {
+        u32(s)
+            .try_into()
+            .unwrap_or_else(|_| panic!("value out of range for a 16-bit board key: {s}"))
     }
     fn b(s: &str) -> bool {
         // Mirror the env-var resolvers (`resolve_*_active_high`) exactly, and panic on
@@ -220,6 +244,15 @@ fn parse_toml(raw: &str) -> BoardConfig {
             ("display", "i2c_freq_hz") => c.display_i2c_freq_hz = Some(u32(v)),
             ("display", "invert_colors") => c.display_invert_colors = Some(b(v)),
             ("display", "color_order") => c.display_color_order = Some(u(v).to_string()),
+            ("display", "panel") => c.display_panel = Some(u(v).to_string()),
+            ("display", "mirror_x") => c.display_mirror_x = Some(b(v)),
+            ("display", "touch_cs") => c.display_touch_cs = Some(u8(v)),
+            ("display", "touch_irq") => c.display_touch_irq = Some(u8(v)),
+            ("display", "touch_x_min") => c.display_touch_x_min = Some(u16(v)),
+            ("display", "touch_x_max") => c.display_touch_x_max = Some(u16(v)),
+            ("display", "touch_y_min") => c.display_touch_y_min = Some(u16(v)),
+            ("display", "touch_y_max") => c.display_touch_y_max = Some(u16(v)),
+            ("display", "touch_swap_xy") => c.display_touch_swap_xy = Some(b(v)),
             _ => {}
         }
     }
@@ -304,6 +337,9 @@ fn main() {
         }
         if let Some(v) = b.display_wake_active_high {
             set("WAKE_ACTIVE_HIGH", if v { "1" } else { "0" });
+        }
+        if let Some(ref v) = b.display_panel {
+            set("DISPLAY_PANEL", v);
         }
     }
 
@@ -476,6 +512,15 @@ fn main() {
             disp!($key, v);
         }};
     }
+    // Trusted-display panel (the `display` build only): `st7789` (default, the
+    // Waveshare RP2350-Touch-LCD-2.8 — PIO serial + CST328 I2C touch) or `ili9341`
+    // (a bare ILI9341 module + XPT2046 resistive touch sharing hardware SPI0).
+    let display_panel = resolve_display_panel();
+    println!("cargo:rustc-cfg=display_panel=\"{display_panel}\"");
+    println!("cargo:rustc-check-cfg=cfg(display_panel, values(\"st7789\", \"ili9341\"))");
+    println!("cargo:rerun-if-env-changed=DISPLAY_PANEL");
+    let ili = display_panel == "ili9341";
+
     let b = board.as_ref();
     // A board config only counts as a display board once it sets `display_cs` —
     // the chip-select is the semantic gate pin, so a `[display]` section it
@@ -487,31 +532,43 @@ fn main() {
     // boards/waveshare-touch-lcd.toml; it kept the pre-PIO 62.5 MHz after that file
     // moved to 80, which left every display build without an explicit `BOARD=` — the
     // one check.sh compiles included — asserting itself dead in `PioDisplayTx::new`.
+    // The `ili9341` fallbacks mirror boards/waveshare-zero-ili9341.toml: 40 MHz asks
+    // hardware SPI0 for clk_peri/4 (37.5 MHz at the stock 150 MHz clock).
     disp!(
         "PK_DISPLAY_SPI_FREQ_HZ",
         disp_cfg
             .and_then(|b| b.display_spi_freq_hz)
-            .unwrap_or(80_000_000)
+            .unwrap_or(if ili { 40_000_000 } else { 80_000_000 })
     );
     disp_pin!(
         "PK_DISPLAY_CS",
-        disp_cfg.and_then(|b| b.display_cs).unwrap_or(13)
+        disp_cfg
+            .and_then(|b| b.display_cs)
+            .unwrap_or(if ili { 5 } else { 13 })
     );
     disp_pin!(
         "PK_DISPLAY_DC",
-        disp_cfg.and_then(|b| b.display_dc).unwrap_or(14)
+        disp_cfg
+            .and_then(|b| b.display_dc)
+            .unwrap_or(if ili { 7 } else { 14 })
     );
     disp_pin!(
         "PK_DISPLAY_RST",
-        disp_cfg.and_then(|b| b.display_rst).unwrap_or(15)
+        disp_cfg
+            .and_then(|b| b.display_rst)
+            .unwrap_or(if ili { 8 } else { 15 })
     );
     disp_pin!(
         "PK_DISPLAY_BL_PIN",
-        disp_cfg.and_then(|b| b.display_bl_pin).unwrap_or(16)
+        disp_cfg
+            .and_then(|b| b.display_bl_pin)
+            .unwrap_or(if ili { 10 } else { 16 })
     );
     disp!(
         "PK_DISPLAY_BL_PWM_SLICE",
-        disp_cfg.and_then(|b| b.display_bl_pwm_slice).unwrap_or(0)
+        disp_cfg
+            .and_then(|b| b.display_bl_pwm_slice)
+            .unwrap_or(if ili { 5 } else { 0 })
     );
     disp!(
         "PK_DISPLAY_BL_PWM_CHANNEL",
@@ -528,9 +585,10 @@ fn main() {
             .unwrap_or(400_000)
     );
     {
+        // An ILI9341 module wants inversion off and BGR; the ST7789 the opposite.
         let v = if disp_cfg
             .and_then(|b| b.display_invert_colors)
-            .unwrap_or(true)
+            .unwrap_or(!ili)
         {
             "1"
         } else {
@@ -543,7 +601,7 @@ fn main() {
     {
         let v = if disp_cfg
             .and_then(|b| b.display_color_order.as_deref())
-            .unwrap_or("rgb")
+            .unwrap_or(if ili { "bgr" } else { "rgb" })
             == "bgr"
         {
             "1"
@@ -554,6 +612,47 @@ fn main() {
             println!("cargo:rustc-env=PK_DISPLAY_COLOR_ORDER={}", v);
         }
     }
+    // MADCTL MX (column mirror). Common ILI9341 modules need it for an unmirrored
+    // portrait image; the ST7789 board does not, so its default leaves MADCTL as is.
+    disp!(
+        "PK_DISPLAY_MIRROR_X",
+        u8::from(disp_cfg.and_then(|b| b.display_mirror_x).unwrap_or(ili))
+    );
+    // XPT2046 on the shared SPI bus (`ili9341` only): chip-select, active-low PENIRQ,
+    // and raw-ADC → pixel calibration (defaults fit the common red-PCB module under MX).
+    // A `min` above its `max` flips that axis; `swap_xy` feeds panel x from raw Y.
+    disp_pin!(
+        "PK_DISPLAY_TOUCH_CS",
+        disp_cfg.and_then(|b| b.display_touch_cs).unwrap_or(6)
+    );
+    disp_pin!(
+        "PK_DISPLAY_TOUCH_IRQ",
+        disp_cfg.and_then(|b| b.display_touch_irq).unwrap_or(9)
+    );
+    disp!(
+        "PK_DISPLAY_TOUCH_X_MIN",
+        disp_cfg.and_then(|b| b.display_touch_x_min).unwrap_or(3800)
+    );
+    disp!(
+        "PK_DISPLAY_TOUCH_X_MAX",
+        disp_cfg.and_then(|b| b.display_touch_x_max).unwrap_or(300)
+    );
+    disp!(
+        "PK_DISPLAY_TOUCH_Y_MIN",
+        disp_cfg.and_then(|b| b.display_touch_y_min).unwrap_or(300)
+    );
+    disp!(
+        "PK_DISPLAY_TOUCH_Y_MAX",
+        disp_cfg.and_then(|b| b.display_touch_y_max).unwrap_or(3800)
+    );
+    disp!(
+        "PK_DISPLAY_TOUCH_SWAP_XY",
+        u8::from(
+            disp_cfg
+                .and_then(|b| b.display_touch_swap_xy)
+                .unwrap_or(false)
+        )
+    );
 
     // Display knobs flow from `board.toml`/env var into PK_DISPLAY_*; any change
     // lets `env!("PK_DISPLAY_*")` go stale and bake the wrong pins into the
@@ -569,6 +668,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PK_DISPLAY_I2C_FREQ_HZ");
     println!("cargo:rerun-if-env-changed=PK_DISPLAY_INVERT_COLORS");
     println!("cargo:rerun-if-env-changed=PK_DISPLAY_COLOR_ORDER");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_MIRROR_X");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_CS");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_IRQ");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_X_MIN");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_X_MAX");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_Y_MIN");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_Y_MAX");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_SWAP_XY");
 
     for (env_var, baked) in [("FAKE_MKEK", "PK_FAKE_MKEK"), ("FAKE_DEVK", "PK_FAKE_DEVK")] {
         if let Some(hex) = resolve_fake_key(env_var) {
@@ -791,14 +898,16 @@ fn resolve_presence_active_high() -> bool {
 
 /// Resolve `WAKE_PIN` — the GPIO of the button that wakes the panel from display
 /// sleep (the trusted-display build only). Default `25` (the board's BAT_PWR /
-/// `KEY_BAT` button on the Waveshare RP2350-Touch-LCD-2.8); `none` disables the
+/// `KEY_BAT` button on the Waveshare RP2350-Touch-LCD-2.8), or `none` under
+/// `DISPLAY_PANEL=ili9341`; `none` disables the
 /// button so only a touch wakes; any `0..=29` selects another GPIO. Returns
 /// `(enabled, pin)`.
 fn resolve_wake_pin() -> (bool, u8) {
     let raw = env::var("WAKE_PIN").unwrap_or_default();
     let v = raw.trim().to_ascii_lowercase();
     if v.is_empty() {
-        return (true, 25); // default: the BAT_PWR button (GPIO25)
+        // Default: the BAT_PWR button (GPIO25); a bare ILI9341 module has none.
+        return (resolve_display_panel() != "ili9341", 25);
     }
     if v == "none" {
         return (false, 0);
@@ -821,6 +930,19 @@ fn resolve_wake_active_high() -> bool {
         "" | "0" | "false" | "no" | "off" => false,
         "1" | "true" | "yes" | "on" => true,
         other => panic!("WAKE_ACTIVE_HIGH={other:?} must be a boolean (0/1, true/false)"),
+    }
+}
+
+/// Resolve `DISPLAY_PANEL` (the trusted-display panel/touch pair, `display` builds
+/// only) to a known value; defaults to `st7789`. Not `DISPLAY`: that name is the
+/// X11 display every Linux desktop session already exports.
+fn resolve_display_panel() -> String {
+    let raw = env::var("DISPLAY_PANEL").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "st7789" => "st7789".into(),
+        "ili9341" => v,
+        _ => panic!("DISPLAY_PANEL={raw:?} must be st7789 or ili9341"),
     }
 }
 

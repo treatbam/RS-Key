@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 RS-Key contributors
+#
+# Waveshare RP2350-Zero + a 2.4" ILI9341 240×320 SPI module with XPT2046
+# resistive touch — the trusted-display build on hand-wired parts. Panel and touch
+# share hardware SPI0 (SCK GP2, MOSI GP3, MISO GP4 — fixed). Onboard WS2812 on
+# GPIO16 stays the status LED. Build with `--features display`.
+
+[usb]
+vidpid = "RSKey"
+
+[led]
+kind = "ws2812"
+pin = 16
+order = "rgb"
+
+[presence]
+source = "bootsel"
+
+[flash]
+size_mb = 4
+kvmain_kb = 1408
+
+[display]
+panel = "ili9341"
+# Panel clock: hardware SPI0 rounds 40 MHz down to clk_peri/4 = 37.5 MHz.
+spi_freq_hz = 40_000_000
+cs = 5
+dc = 7
+rst = 8
+# Backlight PWM (active high; an N-FET driver is fine): GPIO10, slice 5 channel A.
+bl_pin = 10
+bl_pwm_slice = 5
+bl_pwm_channel = "A"
+# Most ILI9341 modules are BGR, non-inverted, and need MADCTL MX for portrait.
+color_order = "bgr"
+invert_colors = false
+mirror_x = true
+# XPT2046: chip-select and the active-low PENIRQ (T_IRQ).
+touch_cs = 6
+touch_irq = 9
+# Raw 12-bit ADC window mapped onto the panel; `min` > `max` flips an axis.
+# Tune per module if taps land off-target (see docs/hardware.md).
+touch_x_min = 3800
+touch_x_max = 300
+touch_y_min = 300
+touch_y_max = 3800
+touch_swap_xy = false
