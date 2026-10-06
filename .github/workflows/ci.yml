@@ -266,9 +266,6 @@ jobs:
           - name: board-waveshare-touch-lcd
             args: "--features display"
             env: "BOARD=waveshare-touch-lcd"
-          - name: board-waveshare-zero-ili9341
-            args: "--features display"
-            env: "BOARD=waveshare-zero-ili9341"
           - name: board-abrobot-4m
             args: ""
             env: "BOARD=abrobot-4m"
