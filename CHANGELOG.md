@@ -38,6 +38,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Added
+
+- **A second trusted-display panel: a 2.4″ ILI9341 module with XPT2046 resistive
+  touch, hand-wired to a Waveshare RP2350-Zero.** Opt in with `DISPLAY_PANEL=ili9341`
+  (or `BOARD=waveshare-zero-ili9341`) plus `--features display`; the default image
+  and the RP2350-Touch-LCD-2.8 flavor build exactly as before. Panel and touch
+  share hardware SPI0 (GP2/3/4) — the panel at 37.5 MHz over DMA, the touch at
+  2 MHz — and reuse the 240×320 screens unchanged through the same retained-frame
+  panel driver, now generic over its transport. Touch reads gate on PENIRQ, take a
+  median of five samples per axis, reject light presses and jittery bursts, and
+  report only once two reads agree (host-tested in `rsk_ui::touch`). Calibration is
+  build-time board knobs for now; there is no on-device calibration screen yet. The
+  onboard WS2812 stays the status LED, and the flavor runs at the stock 150 MHz.
+  Wiring and caveats: [docs/hardware.md](docs/hardware.md#ili9341--xpt2046-on-an-rp2350-zero).
+  `bcdDevice` 0x09DB.
+
 ## [0.4.11] - 2026-09-08
 
 The catch-up release, and the one where the instruments were audited harder than

@@ -27,6 +27,7 @@ export const SAFE_VARIANTS = [
   "board-tenstar-usb",
   "board-seeed-xiao",
   "board-waveshare-touch-lcd",
+  "board-waveshare-zero-ili9341",
   "board-abrobot-4m",
   "board-abrobot-16m",
   "strict-config",

@@ -1,19 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
-//! Raw ST7789 transport for retained frames and small direct redraws.
+//! Raw MIPI-DCS panel driver (ST7789 / ILI9341) for retained frames and small
+//! direct redraws, over the board's serial transport.
 
 use core::convert::Infallible;
 
 use embassy_futures::{block_on, poll_once};
+#[cfg(display_panel = "st7789")]
 use embassy_rp::dma::{Channel, ChannelInstance};
-use embassy_rp::gpio::{Level, Output};
+#[cfg(display_panel = "st7789")]
+use embassy_rp::gpio::Level;
+use embassy_rp::gpio::Output;
+#[cfg(display_panel = "st7789")]
 use embassy_rp::interrupt::typelevel::Binding;
+#[cfg(display_panel = "st7789")]
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
+#[cfg(display_panel = "st7789")]
 use embassy_rp::pio::{
     Common, Config as PioConfig, Direction, FifoJoin, LoadedProgram, PioPin, ShiftDirection,
     StateMachine,
 };
+#[cfg(display_panel = "st7789")]
 use embassy_rp::{Peri, dma};
 use embassy_time::{Duration, block_for};
 use embedded_graphics::{
@@ -28,14 +36,32 @@ use mipidsi::options::{ColorInversion, ColorOrder};
 const DIRECT_CHUNK_BYTES: usize = rsk_ui::PANEL_W as usize * 2;
 const SOLID_CHUNK_BYTES: usize = DIRECT_CHUNK_BYTES * 2;
 const PANEL_PIXEL_FORMAT_RGB565: u8 = 0x55;
+const MADCTL_BGR: u8 = 0x08;
+const MADCTL_MX: u8 = 0x40;
+// ILI9341 §8.2.12: Sleep Out takes 120 ms to settle; the ST7789 board was
+// brought up on 10 ms and keeps it.
+#[cfg(display_panel = "ili9341")]
+const SLEEP_OUT_MS: u64 = 120;
+#[cfg(display_panel = "st7789")]
+const SLEEP_OUT_MS: u64 = 10;
+
+/// The serial link under [`Panel`]: byte writes that return once the bytes are on
+/// the wire (so DC/CS may change after), and a DMA-able bulk write.
+pub(crate) trait PanelBus {
+    fn blocking_write(&mut self, bytes: &[u8]);
+    async fn write(&mut self, bytes: &[u8]);
+    fn flush(&mut self);
+}
 
 /// TX-only mode-0 PIO transport. Two instructions generate one clock period.
+#[cfg(display_panel = "st7789")]
 pub(crate) struct PioDisplayTx {
     sm: StateMachine<'static, PIO0, 0>,
     dma: Channel<'static>,
     _program: LoadedProgram<'static, PIO0>,
 }
 
+#[cfg(display_panel = "st7789")]
 impl PioDisplayTx {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -87,7 +113,10 @@ impl PioDisplayTx {
             _program: program,
         }
     }
+}
 
+#[cfg(display_panel = "st7789")]
+impl PanelBus for PioDisplayTx {
     fn blocking_write(&mut self, bytes: &[u8]) {
         for byte in bytes {
             let value = u32::from_be_bytes([*byte, 0, 0, 0]);
@@ -111,10 +140,40 @@ impl PioDisplayTx {
     }
 }
 
+/// Hardware SPI0, shared by the panel and the XPT2046 touch controller. The async
+/// mutex is what lets a DMA write hold the bus across its `.await`; the two users
+/// run on one executor and never actually contend.
+#[cfg(display_panel = "ili9341")]
+pub(crate) type SharedSpi = embassy_sync::mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::NoopRawMutex,
+    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Async>,
+>;
+
+/// The panel's side of [`SharedSpi`]. The touch driver restores the panel clock
+/// after each read, so nothing here touches the bus configuration.
+#[cfg(display_panel = "ili9341")]
+pub(crate) struct SpiDisplayTx(pub(crate) &'static SharedSpi);
+
+#[cfg(display_panel = "ili9341")]
+impl PanelBus for SpiDisplayTx {
+    fn blocking_write(&mut self, bytes: &[u8]) {
+        // embassy-rp's SPI error type is uninhabited.
+        let _ = block_on(self.0.lock()).blocking_write(bytes);
+    }
+
+    async fn write(&mut self, bytes: &[u8]) {
+        let _ = self.0.lock().await.write(bytes).await;
+    }
+
+    fn flush(&mut self) {
+        let _ = block_on(self.0.lock()).flush();
+    }
+}
+
 /// The write-only panel after initialization. Complete frames use retained
 /// commands and two DMA bands; small animations use the raw direct path.
-pub(crate) struct Panel {
-    spi: PioDisplayTx,
+pub(crate) struct Panel<B: PanelBus> {
+    spi: B,
     cs: Output<'static>,
     dc: Output<'static>,
     // Keep the panel out of reset. Dropping an embassy GPIO output disconnects it.
@@ -124,23 +183,24 @@ pub(crate) struct Panel {
     tags_valid: bool,
 }
 
-impl OriginDimensions for Panel {
+impl<B: PanelBus> OriginDimensions for Panel<B> {
     fn size(&self) -> Size {
         Size::new(rsk_ui::PANEL_W.into(), rsk_ui::PANEL_H.into())
     }
 }
 
-impl Panel {
+impl<B: PanelBus> Panel<B> {
     // Panel construction needs all fixed hardware parts and display options.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        spi: PioDisplayTx,
+        spi: B,
         cs: Output<'static>,
         dc: Output<'static>,
         rst: Output<'static>,
         damage_key: rsk_ui::scene::DamageKey,
         invert: ColorInversion,
         color_order: ColorOrder,
+        mirror_x: bool,
     ) -> Self {
         let mut panel = Self {
             spi,
@@ -151,7 +211,7 @@ impl Panel {
             tile_tags: [0; rsk_ui::scene::DAMAGE_TILES],
             tags_valid: false,
         };
-        panel.reset_and_init(invert, color_order);
+        panel.reset_and_init(invert, color_order, mirror_x);
         panel
     }
 
@@ -166,21 +226,19 @@ impl Panel {
         self.cs.set_high();
     }
 
-    fn reset_and_init(&mut self, invert: ColorInversion, color_order: ColorOrder) {
+    fn reset_and_init(&mut self, invert: ColorInversion, color_order: ColorOrder, mirror_x: bool) {
         self._rst.set_low();
         block_for(Duration::from_micros(10));
         self._rst.set_high();
         block_for(Duration::from_millis(150));
         self.command(0x11, &[]);
-        block_for(Duration::from_millis(10));
-        self.command(
-            0x36,
-            &[if matches!(color_order, ColorOrder::Bgr) {
-                0x08
-            } else {
-                0
-            }],
-        );
+        block_for(Duration::from_millis(SLEEP_OUT_MS));
+        let bgr = if matches!(color_order, ColorOrder::Bgr) {
+            MADCTL_BGR
+        } else {
+            0
+        };
+        self.command(0x36, &[bgr | if mirror_x { MADCTL_MX } else { 0 }]);
         self.command(
             if matches!(invert, ColorInversion::Inverted) {
                 0x21
@@ -293,7 +351,7 @@ impl Panel {
     }
 }
 
-impl rsk_ui::scene::FrameTarget for Panel {
+impl<B: PanelBus> rsk_ui::scene::FrameTarget for Panel<B> {
     fn damage_key(&self) -> rsk_ui::scene::DamageKey {
         self.damage_key
     }
@@ -321,7 +379,7 @@ impl rsk_ui::scene::FrameTarget for Panel {
     }
 }
 
-impl DrawTarget for Panel {
+impl<B: PanelBus> DrawTarget for Panel<B> {
     type Color = Rgb565;
     type Error = Infallible;
 

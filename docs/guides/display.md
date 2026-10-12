@@ -49,6 +49,12 @@ and which of this repo's measurements stop covering this flavor, is written down
 in [limitations.md](../limitations.md). A key without a screen sets no clock and
 is unaffected.
 
+A second, hand-wired target reuses the same screens: a 2.4″ ILI9341 module with
+XPT2046 resistive touch on a Waveshare RP2350-Zero (`DISPLAY_PANEL=ili9341`). It
+drives the panel over hardware SPI at 37.5 MHz with DMA at the stock 150 MHz, so
+none of the overclock notes above apply to it. Wiring, build and caveats are in
+[hardware.md](../hardware.md#ili9341--xpt2046-on-an-rp2350-zero).
+
 ## Try it without a board
 
 The screens on this page are not photographs — they are what `rsk_ui::render`
@@ -97,7 +103,9 @@ nix build .#firmware-display        # → result/firmware.uf2
 display sleep and, while awake, sleeps it on demand from *any* screen. A press
 blanks the panel and (when a device PIN is set) locks the on-device UI, aborting
 any host prompt it interrupts. See the full knob table in [build.md](../build.md);
-the `display`-only knobs are `WAKE_PIN` / `WAKE_ACTIVE_HIGH`.
+the `display`-only knobs are `DISPLAY_PANEL` / `WAKE_PIN` / `WAKE_ACTIVE_HIGH`.
+For the ILI9341 + XPT2046 flavor, `env BOARD=waveshare-zero-ili9341 cargo build
+--release -p firmware --features display` (no `LED_KIND=none` needed).
 
 Flash it like any other image (BOOTSEL → `picotool load`, [hardware.md](../hardware.md)).
 Two notes:

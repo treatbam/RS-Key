@@ -233,7 +233,7 @@ columns = [
   "firmware-2mb", "firmware-16mb", "firmware-strict-config", "keygen-bench",
   "core1-stats", "bench", "fido-conformance", "ea-conformance-rpid",
   "largeblob-ext", "abrobot-16m", "abrobot-4m", "seeed-xiao", "tenstar-usb",
-  "waveshare-one", "waveshare-touch-lcd",
+  "waveshare-one", "waveshare-touch-lcd", "waveshare-zero-ili9341",
 ]
 disposition = "out-of-scope"
 basis = "crate-absent"
@@ -304,9 +304,48 @@ Identical cargo-feature closure, and every knob listed above is the value \
 `firmware/build.rs` already resolves to when the knob is unset: `VIDPID=RSKey`, \
 `LED_KIND=ws2812` `rgb` on GPIO16, BOOTSEL presence, `DEFAULT_FLASH_SIZE` 4 MB \
 with `DEFAULT_KVMAIN` 1408 K. `BOARD=waveshare-one` is the default image under \
-a board name, which is why it is the only board that earns the whole column — \
+a board name, which is why it is the only board that earns the whole column \
+(`waveshare-zero-ili9341` adds only inert display keys to the same set) — \
 and because the delta carries the VALUES, a preset that drifts off one of those \
 defaults stops earning it."""
+
+[[cell]]
+# The default image plus inert ILI9341 panel pins.
+properties = [
+  "SEC-FIDO-001", "SEC-FIDO-002", "SEC-FIDO-003", "SEC-FIDO-004",
+  "SEC-FIDO-005", "SEC-FIDO-006", "SEC-FIDO-006A", "SEC-FIDO-006B",
+  "SEC-FIDO-006C", "SEC-FIDO-007", "SEC-FIDO-008", "SEC-STORE-001",
+  "SEC-STORE-002", "SEC-STORE-003", "SEC-STORE-004", "SEC-STORE-005",
+  "SEC-STORE-006", "SEC-LAT-001", "SEC-LAT-002", "SEC-LAT-003",
+  "SEC-POL-001", "SEC-POL-002", "SEC-POL-003", "SEC-POL-004", "SEC-POL-005",
+  "SEC-POL-006", "SEC-SEAM-001", "SEC-SEAM-002", "SEC-SEAM-003",
+  "SEC-SEAM-006", "SEC-ADM-002", "SEC-ADM-004", "SEC-BOOT-001",
+  "SEC-BOOT-002", "SEC-TRANS-001", "SEC-TRANS-002", "SEC-TRANS-003",
+]
+columns = ["waveshare-zero-ili9341"]
+same_as = "firmware"
+knob_delta = [
+  "display.bl_pin=10", "display.bl_pwm_channel=A", "display.bl_pwm_slice=5",
+  "display.color_order=bgr", "display.cs=5", "display.dc=7",
+  "display.invert_colors=False", "display.mirror_x=True",
+  "display.panel=ili9341", "display.rst=8", "display.spi_freq_hz=40000000",
+  "display.touch_cs=6", "display.touch_irq=9", "display.touch_swap_xy=False",
+  "display.touch_x_max=300", "display.touch_x_min=3800",
+  "display.touch_y_max=3800", "display.touch_y_min=300",
+  "flash.kvmain_kb=1408", "flash.size_mb=4", "led.kind=ws2812",
+  "led.order=rgb", "led.pin=16", "presence.source=bootsel",
+  "usb.vidpid=RSKey",
+]
+disposition = "equivalent"
+basis = "same-cargo-features"
+why = """
+Identical cargo-feature closure, and outside the `display` keys every knob is \
+`waveshare-one`'s — the value `firmware/build.rs` resolves to when unset: \
+`VIDPID=RSKey`, `LED_KIND=ws2812` `rgb` on GPIO16, BOOTSEL presence, 4 MB with \
+1408 K. Without `--features display` the `[display]` keys, `DISPLAY_PANEL` \
+included, compile as inert constants and a `cfg` nothing reads, and display \
+knobs reach no P0-family statement. The `--features display` image this preset \
+is meant for is the `firmware-display` question, not this column's."""
 
 [[cell]]
 # Default flash geometry; the deltas are the LED and the presence SOURCE.
