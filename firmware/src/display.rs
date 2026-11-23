@@ -3,8 +3,9 @@
 
 //! This board's trusted display: the Waveshare RP2350-Touch-LCD-2.8 (ST7789 over
 //! PIO serial output, CST328 touch over I2C1) — or, built `DISPLAY_PANEL=ili9341`, an
-//! ILI9341 module with XPT2046 touch sharing SPI0 (`display_xpt2046.rs`) — plus the
-//! board verbs the flow asks for.
+//! ILI9341 module with XPT2046 touch sharing SPI0 (`display_xpt2046.rs`), or with
+//! `DISPLAY_BUS=pio` the panel on a PIO link and the touch bit-banged on its own
+//! pins — plus the board verbs the flow asks for.
 //!
 //! The flow itself — which screen is shown when, the PIN pad, the Approve/Deny
 //! wait — is [`rsk_display`], where a host can run it against a window. What is
@@ -38,13 +39,16 @@ use crate::handler::{FidoRng, Store};
 
 #[path = "display_panel.rs"]
 mod display_panel;
+#[cfg(display_bus = "pio")]
+pub(crate) use display_panel::{PioDisplayTx, steal_pio_pin};
 #[cfg(display_panel = "st7789")]
-pub(crate) use display_panel::PioDisplayTx;
-#[cfg(display_panel = "st7789")]
-type PanelTx = PioDisplayTx;
-#[cfg(display_panel = "ili9341")]
+type PanelTx = PioDisplayTx<embassy_rp::peripherals::PIO0>;
+// PIO1: the ILI9341 keeps the WS2812, whose driver owns PIO0.
+#[cfg(all(display_panel = "ili9341", display_bus = "pio"))]
+type PanelTx = PioDisplayTx<embassy_rp::peripherals::PIO1>;
+#[cfg(display_bus = "spi0")]
 pub(crate) use display_panel::{SharedSpi, SpiDisplayTx};
-#[cfg(display_panel = "ili9341")]
+#[cfg(display_bus = "spi0")]
 type PanelTx = SpiDisplayTx;
 type Panel = display_panel::Panel<PanelTx>;
 
@@ -92,7 +96,12 @@ pub fn backlight_cfg(duty: u16) -> PwmConfig {
     // `PwmConfig` is `#[non_exhaustive]`, so build from Default and set fields.
     let mut cfg = PwmConfig::default();
     cfg.top = BL_TOP;
-    cfg.compare_a = duty.min(BL_TOP);
+    // The duty goes on the board's backlight channel (B on the stacked RP2350-Zero's GP5).
+    if crate::BUILD_DISPLAY_BL_PWM_CHANNEL == 1 {
+        cfg.compare_b = duty.min(BL_TOP);
+    } else {
+        cfg.compare_a = duty.min(BL_TOP);
+    }
     cfg
 }
 

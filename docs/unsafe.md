@@ -7,22 +7,23 @@ contained. Adding a new `unsafe` requires updating this page. (Safe Rust rules
 out memory-corruption bugs in this code. It is not a security audit; see the
 [threat model](threat-model.md).)
 
-**Runtime sites: 24.** Fourteen in the firmware proper (`main.rs` + `presence.rs`):
-the interrupt-handler pair (2), the `Send` impl, the heap init, and the ten
-GPIO-pin `steal`s (the presence button, the LED power-enable rail, the nuisance
-USR LED, the display build's wake button, and — display builds only — the panel's
-CS/DC/RST/TP_RST control lines, plus the ILI9341 flavor's SPI0/touch pins and its
-backlight pad). Three for the per-core prime sieves and one
+**Runtime sites: 29.** Nineteen in the firmware proper (`main.rs` + `presence.rs`
++ `display_panel.rs`): the interrupt-handler pair (2), the `Send` impl, the heap
+init, and the fifteen GPIO-pin `steal`s (the presence button, the LED power-enable
+rail, the nuisance USR LED, the display build's wake button, and — display builds
+only — the panel's CS/DC/RST/TP_RST control lines, the ILI9341 flavor's SPI0/touch
+pins and its backlight pad, and the PIO link's by-number pin steal with its
+callers, the PIO-bus ILI9341's touch pins and its slice-2 backlight). Three for the per-core prime sieves and one
 stack limit per core, three in the RSA assembly FFI, two in the standalone
 flash-wipe tool.
 
 ```mermaid
 flowchart TB
-    subgraph fw["firmware/src/main.rs + firmware/src/presence.rs"]
+    subgraph fw["firmware/src/main.rs + presence.rs + display_panel.rs"]
       a["interrupt executor (×2)"]
       b["Send for SendUsb"]
       c["heap init"]
-      d["GPIO pin steal ×10 (presence, LED power, USR LED, display wake + CS/DC/RST/TP_RST, ILI9341 bus/touch + backlight)"]
+      d["GPIO pin steal ×15 (presence, LED power, USR LED, display wake + CS/DC/RST/TP_RST, ILI9341 bus/touch + backlight, PIO link pins)"]
       d2["core0 stack limit (MSPLIM)"]
     end
     subgraph kg["firmware/src/core1.rs"]
@@ -86,7 +87,7 @@ static buffer used by nothing else.
 *Safe alternative:* none; every embedded allocator initializes this way.
 *Containment:* one call, before any allocation can happen.
 
-### 5–14. GPIO pin type-erasure (presence button, LED power rail, USR-LED-off, display wake + control pins, ILI9341 bus/touch + backlight, ×10) — `PLAT-UNSAFE-004`
+### 5–19. GPIO pin type-erasure (presence button, LED power rail, USR-LED-off, display wake + control pins, ILI9341 bus/touch + backlight, PIO link pins, ×15) — `PLAT-UNSAFE-004`
 
 ```rust
 let any = unsafe { AnyPin::steal(pin) };
@@ -138,9 +139,26 @@ fixed 18/19/20; the backlight is limited to channel-A GPIO 6/8/10/12/14 on PWM
 slices no LED backend touches; and the LED's runtime pin filter also drops a
 phy-written data pin that names any display pad back to the build default.
 
+The PIO link's clock and data pins are board-file numbers too
+(`display.pio_clk`/`pio_data`; 10/11 on the 2.8″ board). `make_pio_pin` wants a
+typed pin, so `steal_pio_pin` in `firmware/src/display_panel.rs` (an `unsafe fn` plus the
+`PIN_n::steal()` in its one-arm-per-GPIO `match`) hands the numbered pad to the PIO,
+and the panel blocks of `main.rs` call it: the ST7789 block for its two link pins,
+and the PIO-bus ILI9341 block (`DISPLAY_BUS=pio`, the stacked RP2350-Zero) for its
+link pins beside its XPT2046's bit-banged DCLK/DIN/DOUT/CS/PENIRQ by number. That
+flavor's backlight `match` adds GPIO5 on PWM slice 2 channel B, and steals the
+slice as well as the pin, because the LED block's pimoroni arm names `PWM_SLICE2`.
+*Safe alternative:* none — the pin is a build-time number, and on the ILI9341 the
+LED block may already have moved the typed pins and the slice out of `p`.
+*Containment:* the link pins are the build's `HW_PINS`, checked pairwise against
+each other, every panel/touch pin, I2C1 (2.8″ board), an enabled `WAKE_PIN`,
+`LED_PIN`/`LED_POWER_PIN` and the pimoroni pins at compile time, and dropped from a
+phy-written LED pin at boot; a slice-1/2 backlight refuses `LED_KIND=pimoroni` at
+compile time and a phy-written pimoroni driver at boot.
+
 ## Firmware dual-core keygen (`firmware/src/core1.rs`)
 
-### 15–17. The per-core prime sieves — `PLAT-UNSAFE-005`
+### 20–22. The per-core prime sieves — `PLAT-UNSAFE-005`
 
 ```rust
 static mut CORE0_SIEVE: IncrementalSieve = IncrementalSieve::new();
@@ -172,7 +190,7 @@ on core0; the partition (which core touches which sieve) is structural, and the 
 a candidate, scrubbed at the top of every keygen). A wrong residue can only let
 a composite through to the strong-MR/Lucas test, which still rejects it.
 
-### 18–19. The per-core stack limits (`main.rs`, `core1.rs`) — `PLAT-UNSAFE-006`
+### 23–24. The per-core stack limits (`main.rs`, `core1.rs`) — `PLAT-UNSAFE-006`
 
 ```rust
 unsafe { cortex_m::register::msplim::write(&raw const _stack_end as u32) }; // core0, entering `main`
@@ -207,7 +225,7 @@ issued by the routine that is at that moment generating and storing a key.
 
 ## RSA assembly FFI (`crates/rsk-rsa/src/lib.rs`)
 
-### 20–22. The modexp / CRT-sign calls — `PLAT-UNSAFE-007`
+### 25–27. The modexp / CRT-sign calls — `PLAT-UNSAFE-007`
 
 On-card RSA key generation needs hundreds of modular exponentiations over
 1024–2048-bit candidates. The pure-Rust path was ~7× too slow on the
@@ -226,7 +244,7 @@ all host tests exercise the same API safely.
 
 ## Flash wiper (`rsk-wipe/src/main.rs`)
 
-### 23–24. Raw flash erase/program in a critical section — `PLAT-UNSAFE-008`
+### 28–29. Raw flash erase/program in a critical section — `PLAT-UNSAFE-008`
 
 The wiper's entire job is to erase the flash the firmware lives on, from a
 RAM-resident image. It calls the ROM flash-erase/program routines inside

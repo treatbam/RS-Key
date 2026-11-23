@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 RS-Key contributors
+#
+# Waveshare RP2350-Zero (4 MB) stacked straight onto a 2.4" ILI9341 240×320 SPI
+# module with XPT2046 resistive touch: the Zero's GP0..GP8 edge sits on the
+# module's CS..T_CS header pins, and five jumpers add VCC, GND, T_DIN, T_DO and
+# T_IRQ. SPI0 can't take that pin order, so the panel runs on a PIO link (PIO1)
+# and the touch is bit-banged. Onboard WS2812 on GPIO16 stays the status LED.
+# Build with `--features display`.
+
+[usb]
+vidpid = "RSKey"
+
+[led]
+kind = "ws2812"
+pin = 16
+order = "rgb"
+
+[presence]
+source = "bootsel"
+
+[flash]
+size_mb = 4
+kvmain_kb = 1408
+
+[display]
+panel = "ili9341"
+bus = "pio"
+# TX-only PIO uses two instructions per bit at a 160 MHz system clock, divider 2.
+spi_freq_hz = 40_000_000
+# Panel link: SCK on GPIO4, SDI (MOSI) on GPIO3. The module's SDO lands on GPIO6,
+# which is left unclaimed (the panel is never read).
+pio_clk = 4
+pio_data = 3
+cs = 0
+rst = 1
+dc = 2
+# Backlight PWM (active high; the module's own Q1 switches it): GPIO5, slice 2 channel B.
+bl_pin = 5
+bl_pwm_slice = 2
+bl_pwm_channel = "B"
+# Same module as boards/waveshare-zero-ili9341.toml: BGR, non-inverted, MADCTL MX.
+color_order = "bgr"
+invert_colors = false
+mirror_x = true
+# XPT2046, bit-banged: T_CLK and T_CS sit on the header, DIN/DOUT/PENIRQ are jumpered.
+touch_clk = 7
+touch_cs = 8
+touch_din = 9
+touch_dout = 10
+touch_irq = 11
+# Raw 12-bit ADC window mapped onto the panel; `min` > `max` flips an axis.
+# Y is flipped against boards/waveshare-zero-ili9341.toml: stacked, the module's
+# Y reading runs top-to-bottom the other way (measured on hardware; X unchanged).
+# Tune per module if taps land off-target (see docs/hardware.md).
+touch_x_min = 3800
+touch_x_max = 300
+touch_y_min = 3800
+touch_y_max = 300
+touch_swap_xy = false

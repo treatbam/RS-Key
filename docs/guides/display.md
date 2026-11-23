@@ -54,6 +54,9 @@ XPT2046 resistive touch on a Waveshare RP2350-Zero (`DISPLAY_PANEL=ili9341`). It
 drives the panel over hardware SPI at 37.5 MHz with DMA at the stock 150 MHz, so
 none of the overclock notes above apply to it. Wiring, build and caveats are in
 [hardware.md](../hardware.md#ili9341--xpt2046-on-an-rp2350-zero).
+A stacked variant of it (`BOARD=waveshare-zero-ili9341-stacked`, the Zero
+soldered onto the module's header) can't use SPI0, so it drives the panel over the
+PIO link at 40 MHz and does run at 160 MHz, with the same notes as above.
 
 ## Try it without a board
 

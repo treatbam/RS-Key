@@ -227,7 +227,9 @@ covers the security boundary. This page covers feature and hardware gaps.
   garbles at that rate is not detectable in software. What that buys is 1 ms per
   full repaint. What it costs is that XIP timing, TRNG sampling and every
   constant-time measurement in this repo were taken at 150 MHz and do not cover
-  this flavor, which no other build shares. The standard key without a screen is
+  this flavor, which no other build shares but the stacked ILI9341 preset
+  (`waveshare-zero-ili9341-stacked`), whose PIO panel link runs at 160 / 4 = 40
+  MHz on the same clock. The standard key without a screen is
   unaffected — it never sets a clock. *Status: accepted deliberately for the
   display flavor; the ratio is held by a const assert in `firmware/src/main.rs`
   so a board file cannot move one half of it alone.*

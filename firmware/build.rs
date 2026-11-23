@@ -87,6 +87,13 @@ struct BoardConfig {
     display_touch_y_min: Option<u16>,
     display_touch_y_max: Option<u16>,
     display_touch_swap_xy: Option<bool>,
+    // Panel transport (`bus = "pio"` on an ILI9341 board) and its pins
+    display_bus: Option<String>,
+    display_pio_clk: Option<u8>,
+    display_pio_data: Option<u8>,
+    display_touch_clk: Option<u8>,
+    display_touch_din: Option<u8>,
+    display_touch_dout: Option<u8>,
 }
 
 fn read_board() -> Option<BoardConfig> {
@@ -139,6 +146,12 @@ fn parse_toml(raw: &str) -> BoardConfig {
         display_touch_y_min: None,
         display_touch_y_max: None,
         display_touch_swap_xy: None,
+        display_bus: None,
+        display_pio_clk: None,
+        display_pio_data: None,
+        display_touch_clk: None,
+        display_touch_din: None,
+        display_touch_dout: None,
     };
     let mut sec = "";
     fn strip_comment(s: &str) -> &str {
@@ -253,6 +266,12 @@ fn parse_toml(raw: &str) -> BoardConfig {
             ("display", "touch_y_min") => c.display_touch_y_min = Some(u16(v)),
             ("display", "touch_y_max") => c.display_touch_y_max = Some(u16(v)),
             ("display", "touch_swap_xy") => c.display_touch_swap_xy = Some(b(v)),
+            ("display", "bus") => c.display_bus = Some(u(v).to_string()),
+            ("display", "pio_clk") => c.display_pio_clk = Some(u8(v)),
+            ("display", "pio_data") => c.display_pio_data = Some(u8(v)),
+            ("display", "touch_clk") => c.display_touch_clk = Some(u8(v)),
+            ("display", "touch_din") => c.display_touch_din = Some(u8(v)),
+            ("display", "touch_dout") => c.display_touch_dout = Some(u8(v)),
             _ => {}
         }
     }
@@ -340,6 +359,9 @@ fn main() {
         }
         if let Some(ref v) = b.display_panel {
             set("DISPLAY_PANEL", v);
+        }
+        if let Some(ref v) = b.display_bus {
+            set("DISPLAY_BUS", v);
         }
     }
 
@@ -520,6 +542,13 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(display_panel, values(\"st7789\", \"ili9341\"))");
     println!("cargo:rerun-if-env-changed=DISPLAY_PANEL");
     let ili = display_panel == "ili9341";
+    // The panel's transport: `pio` (the ST7789's only bus, and the ILI9341's when its
+    // header lands on pins SPI0 can't take — boards/waveshare-zero-ili9341-stacked.toml)
+    // or `spi0` (the ILI9341 default, shared with the XPT2046).
+    let display_bus = resolve_display_bus(ili);
+    println!("cargo:rustc-cfg=display_bus=\"{display_bus}\"");
+    println!("cargo:rustc-check-cfg=cfg(display_bus, values(\"spi0\", \"pio\"))");
+    println!("cargo:rerun-if-env-changed=DISPLAY_BUS");
 
     let b = board.as_ref();
     // A board config only counts as a display board once it sets `display_cs` —
@@ -654,6 +683,35 @@ fn main() {
         )
     );
 
+    // The PIO link's clock and data pins (the ST7789 board's hard-wired 10/11 by
+    // default), and — on a PIO-bus ILI9341, where the XPT2046 can't share the
+    // panel's write-only link — the touch controller's own bit-banged clock and data.
+    // Defaults mirror boards/waveshare-zero-ili9341-stacked.toml.
+    disp_pin!(
+        "PK_DISPLAY_PIO_CLK",
+        disp_cfg
+            .and_then(|b| b.display_pio_clk)
+            .unwrap_or(if ili { 4 } else { 10 })
+    );
+    disp_pin!(
+        "PK_DISPLAY_PIO_DATA",
+        disp_cfg
+            .and_then(|b| b.display_pio_data)
+            .unwrap_or(if ili { 3 } else { 11 })
+    );
+    disp_pin!(
+        "PK_DISPLAY_TOUCH_CLK",
+        disp_cfg.and_then(|b| b.display_touch_clk).unwrap_or(7)
+    );
+    disp_pin!(
+        "PK_DISPLAY_TOUCH_DIN",
+        disp_cfg.and_then(|b| b.display_touch_din).unwrap_or(9)
+    );
+    disp_pin!(
+        "PK_DISPLAY_TOUCH_DOUT",
+        disp_cfg.and_then(|b| b.display_touch_dout).unwrap_or(10)
+    );
+
     // Display knobs flow from `board.toml`/env var into PK_DISPLAY_*; any change
     // lets `env!("PK_DISPLAY_*")` go stale and bake the wrong pins into the
     // firmware image — re-rustc on any of them.
@@ -676,6 +734,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_Y_MIN");
     println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_Y_MAX");
     println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_SWAP_XY");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_PIO_CLK");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_PIO_DATA");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_CLK");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_DIN");
+    println!("cargo:rerun-if-env-changed=PK_DISPLAY_TOUCH_DOUT");
 
     for (env_var, baked) in [("FAKE_MKEK", "PK_FAKE_MKEK"), ("FAKE_DEVK", "PK_FAKE_DEVK")] {
         if let Some(hex) = resolve_fake_key(env_var) {
@@ -943,6 +1006,18 @@ fn resolve_display_panel() -> String {
         "" | "st7789" => "st7789".into(),
         "ili9341" => v,
         _ => panic!("DISPLAY_PANEL={raw:?} must be st7789 or ili9341"),
+    }
+}
+
+/// Resolve `DISPLAY_BUS` — the panel's transport. The ST7789 board only has its PIO
+/// link; an ILI9341 defaults to hardware SPI0 and takes `pio` when its pins can't.
+fn resolve_display_bus(ili: bool) -> String {
+    let raw = env::var("DISPLAY_BUS").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    match (v.as_str(), ili) {
+        ("", true) | ("spi0", true) => "spi0".into(),
+        ("", false) | ("pio", _) => "pio".into(),
+        _ => panic!("DISPLAY_BUS={raw:?} must be pio, or spi0 with DISPLAY_PANEL=ili9341"),
     }
 }
 

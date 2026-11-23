@@ -164,6 +164,67 @@ What differs from the 2.8″ board:
 > [threat model](threat-model.md), but this build makes them cheaper: keep it in a
 > closed case.
 
+### Stacked: the Zero soldered straight onto the module's header
+
+**Early hardware test: flashes, draws and takes taps** (with the touch Y axis
+flipped as below); not yet exercised through a full ceremony. Same parts, no loose bus wires: the Zero
+sits on the module's 14-pin header so its GP0..GP8 edge lands on `CS`..`T_CS`, and
+five short jumpers do the rest. SPI0 can't take that pin order (its clock pins
+come right before its data-out pins; the header has MOSI before SCK), so this
+preset drives the panel over the same TX-only PIO link as the 2.8″ board — on
+PIO1, since the WS2812 keeps PIO0 — and bit-bangs the XPT2046 on its own pins.
+
+```sh
+env BOARD=waveshare-zero-ili9341-stacked cargo build --release -p firmware --features display
+```
+
+| Signal | RP2350-Zero | Module pin | How | Notes |
+|---|---|---|---|---|
+| Power | 3V3 / GND | `VCC` / `GND` | **jumper ×2** | the header's first two pins sit past the Zero's edge |
+| LCD CS | GP0 | `CS` | header | `cs` |
+| LCD reset | GP1 | `RESET` | header | `rst` |
+| LCD DC | GP2 | `DC` | header | `dc` |
+| Panel data | GP3 | `SDI (MOSI)` | header | `pio_data` |
+| Panel clock | GP4 | `SCK` | header | `pio_clk` |
+| Backlight | GP5 | `LED` | header | `bl_pin`; PWM slice 2 **B**, active high (the module's Q1 switches it) |
+| — | GP6 | `SDO (MISO)` | header | left unclaimed: the panel is never read |
+| Touch clock | GP7 | `T_CLK` | header | `touch_clk`, bit-banged at ≤2 MHz |
+| Touch CS | GP8 | `T_CS` | header | `touch_cs` |
+| Touch data in | GP9 | `T_DIN` | **jumper** | `touch_din` |
+| Touch data out | GP10 | `T_DO` | **jumper** | `touch_dout` |
+| Touch IRQ | GP11 | `T_IRQ` | **jumper** | `touch_irq`, active low, internal pull-up |
+| Status LED | GP16 | — | onboard | the Zero's WS2812, kept as the status indicator |
+
+The keys are in
+[`firmware/boards/waveshare-zero-ili9341-stacked.toml`](https://github.com/TheMaxMur/RS-Key/blob/main/firmware/boards/waveshare-zero-ili9341-stacked.toml)
+(`bus = "pio"` is what selects this transport; `DISPLAY_BUS=pio` does the same from
+the environment). The orientation and colour keys are the hand-wired file's, so the notes above
+apply unchanged. The touch window is not: stacked, the module's Y reading runs the
+other way, so the preset flips it (`touch_x_min`/`touch_x_max` = `3800`/`300`,
+`touch_y_min`/`touch_y_max` = `3800`/`300`, no swap), measured on hardware.
+
+What differs from the hand-wired build:
+
+- **Faster panel, overclocked chip.** The PIO link spends two instructions per bit
+  with an integer divider, so this preset runs `clk_sys` at 160 MHz — the 2.8″
+  board's clock — and the panel at 160 / (2 × 2) = **40 MHz**, DMA-fed, against
+  the SPI0 build's 37.5 MHz. At the stock 150 MHz the only integer choices would be
+  37.5 or 75 MHz. The 160 MHz trade is the one
+  [limitations.md](limitations.md) records for the 2.8″ board. `spi_freq_hz =
+  80_000_000` (divider 1) also builds; the short stacked traces may take it, but it
+  is well past the ILI9341's rated write clock and untested.
+- **Touch on its own pins.** The XPT2046 can't share a write-only link, so it gets
+  a software SPI mode-0 transfer at ≤2 MHz (about 0.2 ms per read). The sampling,
+  median, pressure check, debounce and calibration are the same code as the SPI0
+  build.
+- **Pin rules.** The PIO clock/data pins are checked against each other and every
+  other display, LED and wake pin at compile time, like the control lines. GP5's
+  PWM slice 2 is shared with the pimoroni LED backend's blue (GPIO20), so
+  `LED_KIND=pimoroni` is refused at build time and a phy record asking for it keeps
+  the WS2812.
+- The stacked header removes the loose bus wires but not the jumpers: `T_DIN`,
+  `T_DO` and `T_IRQ` still run on wires, so the case warning above still holds.
+
 ## Enclosures
 
 A bare board works fine, but a printed case makes it pocketable. Four community

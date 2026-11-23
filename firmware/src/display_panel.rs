@@ -7,21 +7,19 @@
 use core::convert::Infallible;
 
 use embassy_futures::{block_on, poll_once};
-#[cfg(display_panel = "st7789")]
+#[cfg(display_bus = "pio")]
 use embassy_rp::dma::{Channel, ChannelInstance};
-#[cfg(display_panel = "st7789")]
+#[cfg(display_bus = "pio")]
 use embassy_rp::gpio::Level;
 use embassy_rp::gpio::Output;
-#[cfg(display_panel = "st7789")]
+#[cfg(display_bus = "pio")]
 use embassy_rp::interrupt::typelevel::Binding;
-#[cfg(display_panel = "st7789")]
-use embassy_rp::peripherals::{DMA_CH0, PIO0};
-#[cfg(display_panel = "st7789")]
+#[cfg(display_bus = "pio")]
 use embassy_rp::pio::{
-    Common, Config as PioConfig, Direction, FifoJoin, LoadedProgram, PioPin, ShiftDirection,
-    StateMachine,
+    Common, Config as PioConfig, Direction, FifoJoin, Instance as PioInstance, LoadedProgram,
+    Pin as PioPin, ShiftDirection, StateMachine,
 };
-#[cfg(display_panel = "st7789")]
+#[cfg(display_bus = "pio")]
 use embassy_rp::{Peri, dma};
 use embassy_time::{Duration, block_for};
 use embedded_graphics::{
@@ -53,25 +51,55 @@ pub(crate) trait PanelBus {
     fn flush(&mut self);
 }
 
-/// TX-only mode-0 PIO transport. Two instructions generate one clock period.
-#[cfg(display_panel = "st7789")]
-pub(crate) struct PioDisplayTx {
-    sm: StateMachine<'static, PIO0, 0>,
-    dma: Channel<'static>,
-    _program: LoadedProgram<'static, PIO0>,
+/// Hand GPIO `gpio` to `common`'s PIO block. The link's pins are board-file numbers,
+/// and `Pin` erases the pad type, so one `match` arm per GPIO all return one type.
+///
+/// # Safety
+/// `gpio` must be owned by no other driver (main.rs's compile-time pin asserts).
+#[cfg(display_bus = "pio")]
+pub(crate) unsafe fn steal_pio_pin<P: PioInstance>(
+    common: &mut Common<'static, P>,
+    gpio: u8,
+) -> PioPin<'static, P> {
+    use embassy_rp::peripherals::*;
+    macro_rules! by_number {
+        ($($n:literal => $pin:ident),* $(,)?) => {
+            // SAFETY: the caller guarantees `gpio` has no other owner.
+            match gpio {
+                $($n => common.make_pio_pin(unsafe { $pin::steal() }),)*
+                _ => unreachable!("display PIO pin out of range"),
+            }
+        };
+    }
+    by_number!(
+        0 => PIN_0, 1 => PIN_1, 2 => PIN_2, 3 => PIN_3, 4 => PIN_4, 5 => PIN_5,
+        6 => PIN_6, 7 => PIN_7, 8 => PIN_8, 9 => PIN_9, 10 => PIN_10, 11 => PIN_11,
+        12 => PIN_12, 13 => PIN_13, 14 => PIN_14, 15 => PIN_15, 16 => PIN_16,
+        17 => PIN_17, 18 => PIN_18, 19 => PIN_19, 20 => PIN_20, 21 => PIN_21,
+        22 => PIN_22, 23 => PIN_23, 24 => PIN_24, 25 => PIN_25, 26 => PIN_26,
+        27 => PIN_27, 28 => PIN_28, 29 => PIN_29,
+    )
 }
 
-#[cfg(display_panel = "st7789")]
-impl PioDisplayTx {
+/// TX-only mode-0 PIO transport. Two instructions generate one clock period, so
+/// the wire runs at `clk_sys / (2 * divider)`.
+#[cfg(display_bus = "pio")]
+pub(crate) struct PioDisplayTx<P: PioInstance + 'static> {
+    sm: StateMachine<'static, P, 0>,
+    dma: Channel<'static>,
+    _program: LoadedProgram<'static, P>,
+}
+
+#[cfg(display_bus = "pio")]
+impl<P: PioInstance + 'static> PioDisplayTx<P> {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        common: &mut Common<'static, PIO0>,
-        mut sm: StateMachine<'static, PIO0, 0>,
-        clk: Peri<'static, impl PioPin>,
-        mosi: Peri<'static, impl PioPin>,
-        dma: Peri<'static, DMA_CH0>,
-        irq: impl Binding<<DMA_CH0 as ChannelInstance>::Interrupt, dma::InterruptHandler<DMA_CH0>>
-        + 'static,
+    pub(crate) fn new<D: ChannelInstance>(
+        common: &mut Common<'static, P>,
+        mut sm: StateMachine<'static, P, 0>,
+        mut clk: PioPin<'static, P>,
+        mosi: PioPin<'static, P>,
+        dma: Peri<'static, D>,
+        irq: impl Binding<D::Interrupt, dma::InterruptHandler<D>> + 'static,
         frequency: u32,
     ) -> Self {
         let program = embassy_rp::pio::program::pio_asm!(
@@ -82,8 +110,6 @@ impl PioDisplayTx {
             ".wrap",
         );
         let program = common.load_program(&program.program);
-        let mut clk = common.make_pio_pin(clk);
-        let mosi = common.make_pio_pin(mosi);
         clk.set_output_inversion(false);
 
         let mut config = PioConfig::default();
@@ -93,15 +119,17 @@ impl PioDisplayTx {
         config.shift_out.direction = ShiftDirection::Left;
         config.shift_out.threshold = 8;
         config.fifo_join = FifoJoin::TxOnly;
-        // One bit per two instructions at divider 1, so the wire rate is clk_sys/2.
+        // One bit per two instructions, so the wire rate is clk_sys / (2 * divider),
+        // with an integer divider: a fractional one would jitter the clock edges.
         // `BUILD_DISPLAY_SYS_CLOCK_HZ`'s const assert already refuses a board file
         // that breaks the ratio; this is the backstop for a second caller.
-        assert_eq!(
-            embassy_rp::clocks::clk_sys_freq(),
-            frequency * 2,
-            "the display PIO clocks at half clk_sys and sets no divider"
+        let clk_sys = embassy_rp::clocks::clk_sys_freq();
+        let divider = clk_sys / (frequency * 2);
+        assert!(
+            (1..=u32::from(u16::MAX)).contains(&divider) && divider * frequency * 2 == clk_sys,
+            "the display PIO needs clk_sys to be an integer multiple of twice its rate"
         );
-        config.clock_divider = 1u8.into();
+        config.clock_divider = (divider as u16).into();
         sm.set_config(&config);
         sm.set_pins(Level::Low, &[&clk, &mosi]);
         sm.set_pin_dirs(Direction::Out, &[&clk, &mosi]);
@@ -115,8 +143,8 @@ impl PioDisplayTx {
     }
 }
 
-#[cfg(display_panel = "st7789")]
-impl PanelBus for PioDisplayTx {
+#[cfg(display_bus = "pio")]
+impl<P: PioInstance + 'static> PanelBus for PioDisplayTx<P> {
     fn blocking_write(&mut self, bytes: &[u8]) {
         for byte in bytes {
             let value = u32::from_be_bytes([*byte, 0, 0, 0]);
@@ -143,7 +171,7 @@ impl PanelBus for PioDisplayTx {
 /// Hardware SPI0, shared by the panel and the XPT2046 touch controller. The async
 /// mutex is what lets a DMA write hold the bus across its `.await`; the two users
 /// run on one executor and never actually contend.
-#[cfg(display_panel = "ili9341")]
+#[cfg(display_bus = "spi0")]
 pub(crate) type SharedSpi = embassy_sync::mutex::Mutex<
     embassy_sync::blocking_mutex::raw::NoopRawMutex,
     embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Async>,
@@ -151,10 +179,10 @@ pub(crate) type SharedSpi = embassy_sync::mutex::Mutex<
 
 /// The panel's side of [`SharedSpi`]. The touch driver restores the panel clock
 /// after each read, so nothing here touches the bus configuration.
-#[cfg(display_panel = "ili9341")]
+#[cfg(display_bus = "spi0")]
 pub(crate) struct SpiDisplayTx(pub(crate) &'static SharedSpi);
 
-#[cfg(display_panel = "ili9341")]
+#[cfg(display_bus = "spi0")]
 impl PanelBus for SpiDisplayTx {
     fn blocking_write(&mut self, bytes: &[u8]) {
         // embassy-rp's SPI error type is uninhabited.

@@ -53,6 +53,20 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   onboard WS2812 stays the status LED, and the flavor runs at the stock 150 MHz.
   Wiring and caveats: [docs/hardware.md](docs/hardware.md#ili9341--xpt2046-on-an-rp2350-zero).
   `bcdDevice` 0x09DB.
+- **The ILI9341 flavor, stacked: an RP2350-Zero soldered straight onto the
+  module's header** (`BOARD=waveshare-zero-ili9341-stacked`, `--features display`).
+  That pin order rules out SPI0, so the new `DISPLAY_BUS=pio` puts the panel on the
+  2.8″ board's TX-only PIO link — now on board-file pins (`pio_clk`/`pio_data`) and
+  any PIO block, with an integer clock divider — on PIO1 + DMA at 40 MHz (160 MHz
+  `clk_sys`, divider 2), and bit-bangs the XPT2046 at ≤2 MHz on its own pins
+  through the same sampling and calibration code. The backlight may now sit on a
+  PWM channel B (GP5, slice 2), which refuses the pimoroni LED backend that shares
+  the slice. Five jumpers: VCC, GND, T_DIN, T_DO, T_IRQ. Flashed and drawing on
+  hardware; the touch Y axis is flipped against the hand-wired preset
+  (`touch_y_min = 3800`, `touch_y_max = 300`). The
+  existing ILI9341 and RP2350-Touch-LCD-2.8 presets keep their pins, buses and
+  clocks. Wiring: [docs/hardware.md](docs/hardware.md#stacked-the-zero-soldered-straight-onto-the-modules-header).
+  `bcdDevice` 0x09DC.
 
 ## [0.4.11] - 2026-09-08
 
