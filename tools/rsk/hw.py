@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 RS-Key contributors
 
-"""rsk hw — device hardware wiring and USB-identity strings via the phy record.
+"""rsk hw — device hardware wiring, USB-identity strings, and RTC clock sync.
 
 The phy record (`EF_PHY`) is the device-config blob PicoForge also writes; it
 survives every applet reset and is applied at boot. The rescue applet exposes it
@@ -14,6 +14,8 @@ read-modify-write of ONLY the fields you pass, so anything set elsewhere
   --led-order     the WS2812 wire byte order: rgb / grb (overrides build LED_ORDER)
   --manufacturer  the USB iManufacturer string (overrides the build/VID default)
   --product       the USB iProduct string (overrides the build/VID default)
+  --sync-rtc      sync the device RTC (and DS3231 on I2C1) to the host UTC clock
+  --rtc           read the device's current UTC clock and exit
 
 A non-`none` firmware build compiles all three backends, so these switch the LED
 at runtime — no reflash. The change applies at the NEXT boot, so a warm reboot is
@@ -21,7 +23,9 @@ issued unless --no-reboot. (Per-status COLOURS are a separate, live setting that
 persists in a different record — see `rsk led`.)
 """
 
+from datetime import datetime, timezone
 import sys
+import time
 
 from . import ccid
 from .backup import (
@@ -70,7 +74,7 @@ def register(sub):
     p = sub.add_parser(
         "hw",
         help="device hardware + USB-identity config (LED wiring, touch timeout, "
-        "manufacturer/product strings) via the phy record",
+        "manufacturer/product strings) and RTC clock sync",
     )
     p.add_argument(
         "--led-pin",
@@ -115,6 +119,20 @@ def register(sub):
         "the device, and is truncated to fit — keep it ≤16 bytes to survive intact.",
     )
     p.add_argument(
+        "--sync-rtc",
+        nargs="?",
+        const=-1,
+        type=int,
+        metavar="EPOCH",
+        help="sync the device RTC (and DS3231 on I2C1 when wired) to the host UTC clock "
+        "(or an explicit Unix epoch integer) over CCID",
+    )
+    p.add_argument(
+        "--rtc",
+        action="store_true",
+        help="read the device's current UTC RTC timestamp over CCID and exit",
+    )
+    p.add_argument(
         "--get", action="store_true", help="read the current phy config and exit"
     )
     p.add_argument(
@@ -131,6 +149,45 @@ def register(sub):
     )
     add_pin_arg(p)
     p.set_defaults(func=run)
+
+
+def _encode_rtc_write_apdu(epoch):
+    """Build the rescue WRITE (INS 0x1C, P1=0x02, P2=0x02) APDU carrying a 32-bit
+    big-endian UTC Unix epoch timestamp."""
+    if not 0 <= int(epoch) <= 0xFFFFFFFF:
+        raise SystemExit("--sync-rtc epoch must fit a 32-bit unsigned integer (0..4294967295)")
+    payload = int(epoch).to_bytes(4, "big")
+    return [0x80, 0x1C, 0x02, 0x02, 4] + list(payload)
+
+
+def _decode_rtc_read(data, s1, s2):
+    """Decode the rescue READ (INS 0x1E, P1=0x04, P2=0x02) response into a UTC
+    Unix epoch integer, or None when the device reports SW_COND_NOT_SATISFIED
+    (clock not set / DS3231 OSF set)."""
+    if (s1, s2) == ccid.SW_COND_NOT_SATISFIED:
+        return None
+    if (s1, s2) != ccid.SW_OK or len(data) != 4:
+        raise SystemExit(f"READ RTC failed: {s1:02X}{s2:02X}")
+    return int.from_bytes(bytes(data), "big")
+
+
+def _format_utc(epoch):
+    if epoch is None:
+        return "not set (sync with `rsk hw --sync-rtc`)"
+    iso = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"{iso} ({epoch})"
+
+
+def _read_rtc(conn):
+    d, s1, s2 = ccid.transmit(conn, [0x80, 0x1E, 0x04, 0x02, 0x00])
+    return _decode_rtc_read(d, s1, s2)
+
+
+def _write_rtc(conn, epoch):
+    apdu = _encode_rtc_write_apdu(epoch)
+    _, s1, s2 = ccid.transmit(conn, apdu)
+    if (s1, s2) != ccid.SW_OK:
+        raise SystemExit(f"WRITE RTC failed: {s1:02X}{s2:02X}")
 
 
 def _parse_tlv(data):
@@ -214,7 +271,7 @@ def _show(tlvs):
 
 
 def _would_set(args):
-    """Whether any config flag was passed (vs a bare read/--get)."""
+    """Whether any phy config flag was passed (vs a bare read/--get)."""
     return (
         args.led_pin is not None
         or args.led_driver is not None
@@ -265,22 +322,38 @@ def _apply_args(tlvs, args):
 
 def run(args):
     if args.transport == "fido":
+        if getattr(args, "sync_rtc", None) is not None or getattr(args, "rtc", False):
+            raise SystemExit("--sync-rtc and --rtc require --transport ccid (rescue applet)")
         _run_fido(args)
     else:
         _run_ccid(args)
 
 
 def _run_ccid(args):
-    # Writes EF_PHY — the USB identity — so it must not guess a device either.
+    # Writes EF_PHY / RTC — so it must not guess a device either.
     conn = ccid.connect(exclusive=True)
     _, s1, s2 = ccid.select(conn, RESCUE_AID)
     if (s1, s2) != ccid.SW_OK:
         raise SystemExit(
             f"SELECT rescue AID failed: {s1:02X}{s2:02X} (firmware too old?)"
         )
+    sync_rtc = getattr(args, "sync_rtc", None)
+    read_rtc = getattr(args, "rtc", False)
+    if sync_rtc is not None:
+        target_epoch = int(time.time()) if sync_rtc == -1 else sync_rtc
+        _write_rtc(conn, target_epoch)
+        now_epoch = _read_rtc(conn)
+        print(f"RTC synced ✓  {_format_utc(now_epoch if now_epoch is not None else target_epoch)}")
+        if not _would_set(args) and not args.get:
+            return
+    if read_rtc:
+        print(f"RTC        {_format_utc(_read_rtc(conn))}")
+        if not _would_set(args) and not args.get:
+            return
     tlvs = _read_phy(conn)
     if args.get or not _would_set(args):
         _show(tlvs)
+        print(f"  rtc     {_format_utc(_read_rtc(conn))}")
         return
     _apply_args(tlvs, args)
 

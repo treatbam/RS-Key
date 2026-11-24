@@ -149,3 +149,21 @@ def test_show_absent_strings_use_build_default(capsys):
     out = capsys.readouterr().out
     assert "(build/VID default)" in out
     assert "None" not in out
+
+
+def test_rtc_apdu_encode_and_decode():
+    import pytest
+
+    apdu = hw._encode_rtc_write_apdu(1_764_000_000)
+    assert apdu == [0x80, 0x1C, 0x02, 0x02, 4, 0x69, 0x24, 0x81, 0x00]
+    assert hw._decode_rtc_read([0x69, 0x24, 0x81, 0x00], 0x90, 0x00) == 1_764_000_000
+    assert hw._decode_rtc_read([], 0x69, 0x85) is None
+    assert "2025-11-24T16:00:00Z" in hw._format_utc(1_764_000_000)
+    assert "not set" in hw._format_utc(None)
+
+    with pytest.raises(SystemExit):
+        hw._encode_rtc_write_apdu(-1)
+    with pytest.raises(SystemExit):
+        hw._encode_rtc_write_apdu(1 << 32)
+    with pytest.raises(SystemExit):
+        hw._decode_rtc_read([0x00], 0x90, 0x00)

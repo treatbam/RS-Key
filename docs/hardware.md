@@ -326,10 +326,16 @@ when `HAPTIC_KIND=drv2605` is used (`rtc::SharedI2c1`).
 
 - **Time sync & Oscillator Stop Flag (`OSF`):** At boot (and when opening an OATH
   credential), the firmware checks the DS3231 Status Register (`0x0F` bit 7, `OSF`)
-  and verifies the year is `>= 2025`. When the host syncs the device clock via the
-  rescue applet (`Platform::set_time`), the UTC timestamp is written to DS3231
-  registers `0x00..=0x06` in 24-hour BCD and `OSF` is cleared so time survives
-  unplugging.
+  and verifies the year is `>= 2025`. Sync the device clock from the host with
+  `rsk hw --sync-rtc` (or read it with `rsk hw --rtc`); the UTC timestamp is
+  written to DS3231 registers `0x00..=0x06` in 24-hour BCD and `OSF` is cleared so
+  time survives unplugging:
+
+  ```sh
+  rsk hw --sync-rtc
+  rsk hw --rtc
+  ```
+
 - **Live on-device TOTP:** Opening **Apps → OATH → `<account>`** computes the
   credential's 6–8 digit RFC 6238 TOTP code on-device (`SHA-1`, `SHA-256`, or
   `SHA-512`, custom period prefix) and refreshes the code and countdown once per
