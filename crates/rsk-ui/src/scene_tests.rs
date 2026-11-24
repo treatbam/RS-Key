@@ -762,6 +762,8 @@ fn census_full_frames(label: crate::Label) {
         fido_pin_set: true,
         backup_sealed: true,
         scramble_pin: true,
+        haptic_level: crate::HAPTIC_LEVEL_HIGH,
+        mute_pin_haptic: true,
     };
     let screens = [
         ("render splash", Screen::Splash),
@@ -800,6 +802,7 @@ fn census_full_frames(label: crate::Label) {
         SettingsPage::Brightness,
         SettingsPage::Timeout,
         SettingsPage::Sleep,
+        SettingsPage::Haptics,
         SettingsPage::Security,
     ] {
         let view = SettingsView { page, ..settings };
@@ -947,6 +950,9 @@ fn census_full_frames(label: crate::Label) {
                 digits: u8::MAX,
                 period: u16::MAX,
                 touch: true,
+                clock_set: true,
+                code: Some(99_999_999),
+                remaining_secs: u8::MAX,
             },
         )
     });
@@ -1103,6 +1109,7 @@ const FULL_FRAME_RENDERERS: &[&str] = &[
     "render_share_picker",
     "render_slip39_share",
     "render_success",
+    "render_touch_cal_target",
     "render_wipe_failed",
 ];
 
@@ -1114,6 +1121,7 @@ const PARTIAL_RENDERERS: &[&str] = &[
     "render_home_change",
     "render_locked_breathe",
     "render_nav",
+    "render_oath_cred_code",
     "render_oath_page",
     "render_passkeys_page",
     "render_pin_dots",

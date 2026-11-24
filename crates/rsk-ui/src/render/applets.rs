@@ -606,10 +606,27 @@ where
     Ok(())
 }
 
+/// Format a numeric OATH `code` as zero-padded `digits` (`6..=8`) with a middle space
+/// (e.g. `"123 456"` or `"1234 5678"`).
+fn fmt_totp_code(mut code: u32, digits: u8, buf: &mut [u8; 10]) -> &str {
+    let d = (digits as usize).clamp(6, 8);
+    let mut raw = [b'0'; 8];
+    let mut i = d;
+    while i > 0 {
+        i -= 1;
+        raw[i] = b'0' + (code % 10) as u8;
+        code /= 10;
+    }
+    let split = d / 2;
+    buf[..split].copy_from_slice(&raw[..split]);
+    buf[split] = b' ';
+    buf[split + 1..d + 1].copy_from_slice(&raw[split..d]);
+    str8(&buf[..d + 1])
+}
+
 /// One OATH credential's detail (back-only, no nav): its type, HMAC algorithm, digit
-/// count, TOTP step and touch gate. No code is shown — the device has no clock, so it
-/// cannot compute a time-correct TOTP, and reading a HOTP would burn its counter; the
-/// footer points at the host app where codes are read.
+/// count, TOTP step, touch gate, and (when an RTC is set and the credential is TOTP)
+/// the live TOTP code + countdown or tap-to-reveal affordance.
 pub fn render_oath_cred<D>(t: &mut D, v: &OathDetailView) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -659,13 +676,84 @@ where
             ),
         ],
     )?;
-    text_left(
-        t,
-        "Codes shown in the RS-Key app",
-        EgPoint::new(14, PANEL_H as i32 - 18),
-        Role::MonoSmall,
-        theme::CAPTION,
-    )
+    oath_cred_footer(t, v)
+}
+
+/// Repaint only the OATH detail screen's live TOTP code card (for 1 Hz countdown ticks).
+pub fn render_oath_cred_code<D>(t: &mut D, v: &OathDetailView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    clear_region(t, crate::OATH_CODE_CARD_RECT)?;
+    oath_cred_footer(t, v)
+}
+
+fn oath_cred_footer<D>(t: &mut D, v: &OathDetailView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    if v.hotp {
+        text_left(
+            t,
+            "Codes shown in the RS-Key app",
+            EgPoint::new(14, PANEL_H as i32 - 18),
+            Role::MonoSmall,
+            theme::CAPTION,
+        )
+    } else if let Some(code) = v.code {
+        let r = crate::OATH_CODE_CARD_RECT;
+        card(t, r, theme::SURFACE, theme::BORDER_CARD)?;
+        text_left_on(
+            t,
+            "LIVE TOTP",
+            EgPoint::new(r.x as i32 + 12, r.y as i32 + 16),
+            Role::MonoSmall,
+            theme::CAPTION,
+            theme::SURFACE,
+        )?;
+        let mut rem_buf = [0u8; 8];
+        let rem_col = if v.remaining_secs <= 5 {
+            theme::WARN
+        } else {
+            theme::ACCENT_TEXT
+        };
+        font::right(
+            t,
+            fmt_secs(v.remaining_secs as u16, &mut rem_buf),
+            EgPoint::new((r.x + r.w) as i32 - 12, r.y as i32 + 16),
+            Role::MonoSmall,
+            rem_col,
+            theme::SURFACE,
+        )?;
+        let mut cbuf = [0u8; 10];
+        text_left_on(
+            t,
+            fmt_totp_code(code, v.digits, &mut cbuf),
+            EgPoint::new(r.x as i32 + 12, r.y as i32 + 43),
+            Role::Heading,
+            theme::APPROVE,
+            theme::SURFACE,
+        )
+    } else if v.clock_set && v.touch {
+        let r = crate::OATH_CODE_CARD_RECT;
+        card(t, r, theme::TINT_BLUE, theme::BORDER_FIELD)?;
+        text_on(
+            t,
+            "Tap to reveal code",
+            center(r),
+            Role::Strong,
+            theme::ACCENT_TEXT,
+            theme::TINT_BLUE,
+        )
+    } else {
+        text_left(
+            t,
+            "Clock not set — sync in RS-Key app",
+            EgPoint::new(14, PANEL_H as i32 - 18),
+            Role::MonoSmall,
+            theme::CAPTION,
+        )
+    }
 }
 
 /// The OpenPGP card-holder detail (back-only): the public cardholder data objects, read

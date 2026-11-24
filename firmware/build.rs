@@ -94,6 +94,15 @@ struct BoardConfig {
     display_touch_clk: Option<u8>,
     display_touch_din: Option<u8>,
     display_touch_dout: Option<u8>,
+    // Optional haptic feedback (`[haptic]`)
+    haptic_kind: Option<String>,
+    haptic_pin: Option<u8>,
+    haptic_pwm_slice: Option<u8>,
+    haptic_pwm_channel: Option<String>,
+    haptic_i2c_sda: Option<u8>,
+    haptic_i2c_scl: Option<u8>,
+    haptic_i2c_freq_hz: Option<u32>,
+    haptic_actuator: Option<String>,
 }
 
 fn read_board() -> Option<BoardConfig> {
@@ -152,6 +161,14 @@ fn parse_toml(raw: &str) -> BoardConfig {
         display_touch_clk: None,
         display_touch_din: None,
         display_touch_dout: None,
+        haptic_kind: None,
+        haptic_pin: None,
+        haptic_pwm_slice: None,
+        haptic_pwm_channel: None,
+        haptic_i2c_sda: None,
+        haptic_i2c_scl: None,
+        haptic_i2c_freq_hz: None,
+        haptic_actuator: None,
     };
     let mut sec = "";
     fn strip_comment(s: &str) -> &str {
@@ -272,6 +289,14 @@ fn parse_toml(raw: &str) -> BoardConfig {
             ("display", "touch_clk") => c.display_touch_clk = Some(u8(v)),
             ("display", "touch_din") => c.display_touch_din = Some(u8(v)),
             ("display", "touch_dout") => c.display_touch_dout = Some(u8(v)),
+            ("haptic", "kind") => c.haptic_kind = Some(u(v).to_string()),
+            ("haptic", "pin") => c.haptic_pin = Some(u8(v)),
+            ("haptic", "pwm_slice") => c.haptic_pwm_slice = Some(u8(v)),
+            ("haptic", "pwm_channel") => c.haptic_pwm_channel = Some(u(v).to_string()),
+            ("haptic", "i2c_sda") => c.haptic_i2c_sda = Some(u8(v)),
+            ("haptic", "i2c_scl") => c.haptic_i2c_scl = Some(u8(v)),
+            ("haptic", "i2c_freq_hz") => c.haptic_i2c_freq_hz = Some(u32(v)),
+            ("haptic", "actuator") => c.haptic_actuator = Some(u(v).to_string()),
             _ => {}
         }
     }
@@ -362,6 +387,30 @@ fn main() {
         }
         if let Some(ref v) = b.display_bus {
             set("DISPLAY_BUS", v);
+        }
+        if let Some(ref v) = b.haptic_kind {
+            set("HAPTIC_KIND", v);
+        }
+        if let Some(v) = b.haptic_pin {
+            set("HAPTIC_PIN", &v.to_string());
+        }
+        if let Some(v) = b.haptic_pwm_slice {
+            set("HAPTIC_PWM_SLICE", &v.to_string());
+        }
+        if let Some(ref v) = b.haptic_pwm_channel {
+            set("HAPTIC_PWM_CHANNEL", v);
+        }
+        if let Some(v) = b.haptic_i2c_sda {
+            set("HAPTIC_I2C_SDA", &v.to_string());
+        }
+        if let Some(v) = b.haptic_i2c_scl {
+            set("HAPTIC_I2C_SCL", &v.to_string());
+        }
+        if let Some(v) = b.haptic_i2c_freq_hz {
+            set("HAPTIC_I2C_FREQ_HZ", &v.to_string());
+        }
+        if let Some(ref v) = b.haptic_actuator {
+            set("HAPTIC_ACTUATOR", v);
         }
     }
 
@@ -505,6 +554,36 @@ fn main() {
     let max_leds = resolve_max_leds();
     println!("cargo:rustc-env=PK_MAX_LEDS={max_leds}");
     println!("cargo:rerun-if-env-changed=MAX_LEDS");
+
+    // Optional haptic feedback backend (`HAPTIC_KIND`, default `none`):
+    // - `none`: no code or pins claimed.
+    // - `pwm`: ERM coin motor driven by a GPIO PWM output (default GPIO26, slice 5A).
+    // - `drv2605`: TI DRV2605L on I2C1 (default GPIO14 SDA / GPIO15 SCL, 400 kHz).
+    let haptic_kind = resolve_haptic_kind();
+    println!("cargo:rustc-cfg=haptic_kind=\"{haptic_kind}\"");
+    println!("cargo:rustc-check-cfg=cfg(haptic_kind, values(\"none\", \"pwm\", \"drv2605\"))");
+    println!("cargo:rerun-if-env-changed=HAPTIC_KIND");
+
+    let haptic_actuator = resolve_haptic_actuator();
+    println!("cargo:rustc-cfg=haptic_actuator=\"{haptic_actuator}\"");
+    println!("cargo:rustc-check-cfg=cfg(haptic_actuator, values(\"erm\", \"lra\"))");
+    println!("cargo:rerun-if-env-changed=HAPTIC_ACTUATOR");
+
+    let (haptic_pin, haptic_pwm_slice, haptic_pwm_channel) = resolve_haptic_pwm(&haptic_kind);
+    println!("cargo:rustc-env=PK_HAPTIC_PIN={haptic_pin}");
+    println!("cargo:rustc-env=PK_HAPTIC_PWM_SLICE={haptic_pwm_slice}");
+    println!("cargo:rustc-env=PK_HAPTIC_PWM_CHANNEL={haptic_pwm_channel}");
+    println!("cargo:rerun-if-env-changed=HAPTIC_PIN");
+    println!("cargo:rerun-if-env-changed=HAPTIC_PWM_SLICE");
+    println!("cargo:rerun-if-env-changed=HAPTIC_PWM_CHANNEL");
+
+    let (haptic_i2c_sda, haptic_i2c_scl, haptic_i2c_freq_hz) = resolve_haptic_i2c(&haptic_kind);
+    println!("cargo:rustc-env=PK_HAPTIC_I2C_SDA={haptic_i2c_sda}");
+    println!("cargo:rustc-env=PK_HAPTIC_I2C_SCL={haptic_i2c_scl}");
+    println!("cargo:rustc-env=PK_HAPTIC_I2C_FREQ_HZ={haptic_i2c_freq_hz}");
+    println!("cargo:rerun-if-env-changed=HAPTIC_I2C_SDA");
+    println!("cargo:rerun-if-env-changed=HAPTIC_I2C_SCL");
+    println!("cargo:rerun-if-env-changed=HAPTIC_I2C_FREQ_HZ");
 
     // Bake fake OTP keys into the image instead of reading the fuses — exercises
     // the kbase migration + boot path without an irreversible OTP write.
@@ -1060,6 +1139,145 @@ fn resolve_led_order() -> String {
         "grb" => v,
         _ => panic!("LED_ORDER={raw:?} must be rgb or grb"),
     }
+}
+
+/// Resolve `HAPTIC_KIND` (the optional haptic feedback backend) to a known
+/// value; defaults to `none`. One of: `none` (disabled), `pwm` (ERM coin motor
+/// on a GPIO PWM output), or `drv2605` (TI DRV2605L over I2C1).
+fn resolve_haptic_kind() -> String {
+    let raw = env::var("HAPTIC_KIND").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "none" => "none".into(),
+        "pwm" | "drv2605" => v,
+        _ => panic!("HAPTIC_KIND={raw:?} must be one of: none, pwm, drv2605"),
+    }
+}
+
+/// Resolve `HAPTIC_ACTUATOR` (the DRV2605L actuator mode) to `erm` or `lra`;
+/// defaults to `erm`.
+fn resolve_haptic_actuator() -> String {
+    let raw = env::var("HAPTIC_ACTUATOR").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "erm" => "erm".into(),
+        "lra" => v,
+        _ => panic!("HAPTIC_ACTUATOR={raw:?} must be erm or lra"),
+    }
+}
+
+/// Resolve `HAPTIC_PIN`, `HAPTIC_PWM_SLICE`, and `HAPTIC_PWM_CHANNEL` for the
+/// `pwm` haptic backend.
+///
+/// Defaults to GPIO26 (RP2350 PWM slice 5, channel A). On the RP2350, GPIO `p`
+/// maps deterministically to PWM slice `(p / 2) % 8` and channel `p % 2` (0 = A,
+/// 1 = B); if `HAPTIC_PWM_SLICE` or `HAPTIC_PWM_CHANNEL` is omitted, it is
+/// derived from `HAPTIC_PIN`, and if supplied under `HAPTIC_KIND=pwm` it is
+/// checked against both the 0..=7 slice range and the pin's hardware routing.
+fn resolve_haptic_pwm(kind: &str) -> (u8, u8, u8) {
+    let raw_pin = env::var("HAPTIC_PIN").unwrap_or_else(|_| "26".into());
+    let pin = raw_pin
+        .trim()
+        .parse::<u8>()
+        .unwrap_or_else(|_| panic!("HAPTIC_PIN={raw_pin:?} must be a GPIO number 0..=29"));
+    assert!(
+        pin <= MAX_GPIO,
+        "HAPTIC_PIN={pin} out of range 0..={MAX_GPIO} (RP2350A GPIOs)"
+    );
+    let expected_slice = (pin / 2) % 8;
+    let expected_channel = pin % 2;
+
+    let slice = match env::var("HAPTIC_PWM_SLICE") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let s = raw.trim().parse::<u8>().unwrap_or_else(|_| {
+                panic!("HAPTIC_PWM_SLICE={raw:?} must be a PWM slice number 0..=7")
+            });
+            assert!(s <= 7, "HAPTIC_PWM_SLICE={s} out of range 0..=7");
+            s
+        }
+        _ => expected_slice,
+    };
+
+    let channel = match env::var("HAPTIC_PWM_CHANNEL") {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim() {
+            "A" | "a" | "0" => 0,
+            "B" | "b" | "1" => 1,
+            other => panic!("HAPTIC_PWM_CHANNEL={other:?} must be A, B, 0, or 1"),
+        },
+        _ => expected_channel,
+    };
+
+    if kind == "pwm" {
+        assert!(
+            slice == expected_slice && channel == expected_channel,
+            "HAPTIC_PIN=GPIO{pin} routes to PWM slice {expected_slice} channel {}, \
+             but HAPTIC_PWM_SLICE={slice} / HAPTIC_PWM_CHANNEL={} was specified",
+            if expected_channel == 0 { "A" } else { "B" },
+            if channel == 0 { "A" } else { "B" }
+        );
+    }
+
+    (pin, slice, channel)
+}
+
+/// Resolve `HAPTIC_I2C_SDA`, `HAPTIC_I2C_SCL`, and `HAPTIC_I2C_FREQ_HZ` for the
+/// `drv2605` haptic backend (default GPIO14 SDA, GPIO15 SCL, 400 kHz on I2C1).
+///
+/// Setting `HAPTIC_I2C_SDA=none` or `HAPTIC_I2C_SCL=none` with
+/// `HAPTIC_KIND=drv2605` panics at build time because the DRV2605L driver
+/// requires a valid I2C1 SDA/SCL pin pair.
+fn resolve_haptic_i2c(kind: &str) -> (u8, u8, u32) {
+    let parse_i2c_pin = |var: &str, raw: String, default: u8| -> u8 {
+        let v = raw.trim().to_ascii_lowercase();
+        if v.is_empty() || v == "none" {
+            assert!(
+                kind != "drv2605",
+                "HAPTIC_KIND=drv2605 requires {var} to be a valid I2C1 GPIO (got {raw:?})"
+            );
+            return default;
+        }
+        let pin = v
+            .parse::<u8>()
+            .unwrap_or_else(|_| panic!("{var}={raw:?} must be a GPIO number 0..=29"));
+        assert!(
+            pin <= MAX_GPIO,
+            "{var}={pin} out of range 0..={MAX_GPIO} (RP2350A GPIOs)"
+        );
+        pin
+    };
+
+    let raw_sda = env::var("HAPTIC_I2C_SDA").unwrap_or_else(|_| "14".into());
+    let raw_scl = env::var("HAPTIC_I2C_SCL").unwrap_or_else(|_| "15".into());
+    let sda = parse_i2c_pin("HAPTIC_I2C_SDA", raw_sda, 14);
+    let scl = parse_i2c_pin("HAPTIC_I2C_SCL", raw_scl, 15);
+    let raw_freq = env::var("HAPTIC_I2C_FREQ_HZ").unwrap_or_else(|_| "400000".into());
+    let clean_freq: String = raw_freq.trim().chars().filter(|c| *c != '_').collect();
+    let freq = clean_freq
+        .parse::<u32>()
+        .unwrap_or_else(|_| panic!("HAPTIC_I2C_FREQ_HZ={raw_freq:?} must be a frequency in Hz"));
+    assert!(
+        (10_000..=1_000_000).contains(&freq),
+        "HAPTIC_I2C_FREQ_HZ={freq} out of range 10_000..=1_000_000"
+    );
+
+    if kind == "drv2605" {
+        assert!(
+            sda != scl,
+            "HAPTIC_I2C_SDA and HAPTIC_I2C_SCL cannot both be GPIO{sda}"
+        );
+        // RP2350 I2C1 SDA sits on GPIO 2, 6, 10, 14, 18, 22, 26 (pin % 4 == 2)
+        // and I2C1 SCL sits on GPIO 3, 7, 11, 15, 19, 23, 27 (pin % 4 == 3).
+        assert!(
+            sda % 4 == 2,
+            "HAPTIC_I2C_SDA=GPIO{sda} is not a valid RP2350 I2C1 SDA pin (expected GPIO 2, 6, 10, 14, 18, 22, or 26)"
+        );
+        assert!(
+            scl % 4 == 3,
+            "HAPTIC_I2C_SCL=GPIO{scl} is not a valid RP2350 I2C1 SCL pin (expected GPIO 3, 7, 11, 15, 19, 23, or 27)"
+        );
+    }
+
+    (sda, scl, freq)
 }
 
 /// Validate a fake-OTP-key env var: exactly 64 hex chars (32 bytes), returned

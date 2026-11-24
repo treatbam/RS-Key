@@ -49,8 +49,8 @@ mod reset;
 mod settings;
 
 pub use applets::{
-    render_apps, render_oath, render_oath_cred, render_oath_page, render_openpgp,
-    render_openpgp_cardholder, render_openpgp_key, render_piv, render_piv_extra,
+    render_apps, render_oath, render_oath_cred, render_oath_cred_code, render_oath_page,
+    render_openpgp, render_openpgp_cardholder, render_openpgp_key, render_piv, render_piv_extra,
     render_piv_extra_page, render_piv_keygen_confirm, render_piv_keygen_pick,
     render_piv_keygen_rsa_pick, render_piv_keygen_working, render_piv_pin_menu,
     render_piv_protect_confirm, render_piv_slot,
@@ -72,7 +72,7 @@ pub use reset::{
     render_confirm_factory_reset, render_erasing, render_pin_blocked, render_success,
     render_success_circle, render_wipe_failed,
 };
-pub use settings::{render_firmware, render_rebooting};
+pub use settings::{render_firmware, render_rebooting, render_touch_cal_target};
 
 use boot::{locked, onboard, splash};
 use ceremony::confirm;

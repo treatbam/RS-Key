@@ -2,7 +2,7 @@
 // Copyright (C) 2026 RS-Key contributors
 
 use super::*;
-use crate::tests::{Env, TestRng, VendorBoard, apdu, dev_conf, select, sw};
+use crate::tests::{Env, TestRng, VendorBoard, apdu, dev_conf, get_creds_metadata, select, sw};
 #[cfg(not(feature = "strict-config"))]
 use crate::tests::{TruncatedScan, WriteStuck};
 #[cfg(not(feature = "strict-config"))]
@@ -749,6 +749,185 @@ fn both_transports_answer_from_one_session_state() {
         over_hid.as_slice(),
         over_ccid.as_slice(),
         "the same power cycle must have exactly one clientPIN key agreement"
+    );
+}
+
+/// The panel's clientPIN signal (a re-key, a rejected PIN, a wipe) ends the host's token on
+/// both FIDO transports. They share one `FidoState`, but only the CTAPHID handler read the
+/// signal, so over a smart-card reader the old token kept working.
+#[test]
+fn a_panel_pin_change_ends_the_token_over_ccid_too() {
+    let env = Env::new();
+    // A live cm-permission token, as getPinUvAuthTokenUsingPinWithPermissions leaves one.
+    {
+        let mut state = env.fido_state.borrow_mut();
+        state.reset_pin_uv_auth_token(&mut *env.rng.borrow_mut());
+        state.begin_using_token(false, 0);
+        state.paut.permissions = rsk_fido::state::PERM_CM;
+    }
+    let metadata = ctap_msg(&get_creds_metadata(&env.fido_state.borrow().paut.token));
+    let mut ccid = env.ccid();
+    assert_eq!(
+        sw(ccid.handle_apdu(&select(rsk_fido::consts::FIDO_AID), 0)),
+        rsk_sdk::Sw::OK
+    );
+
+    let (before, _) = exchange_chained(&mut ccid, &metadata);
+    env.board.borrow_mut().local_pin_change = true;
+    let (after, _) = exchange_chained(&mut ccid, &metadata);
+    assert_eq!(
+        (before[0], after[0]),
+        (
+            rsk_fido::CTAP2_OK,
+            rsk_fido::CtapError::PinAuthInvalid.as_u8()
+        ),
+        "the token the old PIN authorized must stop verifying over CCID once the panel changed it"
+    );
+}
+
+/// Three wrong PINs over CCID engage the §6.5.5.6 soft lock, and it has to reach the board
+/// as CTAPHID's does: the vendor and rescue applets serve an ungated warm reboot on this
+/// same interface, and a lock only RAM held gave a PC/SC host three guesses per reboot.
+#[test]
+fn a_soft_lock_engaged_over_ccid_is_handed_over_for_persisting() {
+    let env = Env::new();
+    let _power_up = env.ctap();
+    rsk_fido::passkeys::store_local_pin(&crate::tests::dev(), &mut env.fs.borrow_mut(), b"123456")
+        .expect("the test PIN meets the default policy");
+    let mut ccid = env.ccid();
+    assert_eq!(
+        sw(ccid.handle_apdu(&select(rsk_fido::consts::FIDO_AID), 0)),
+        rsk_sdk::Sw::OK
+    );
+
+    let wrong = ctap_msg(&crate::tests::wrong_pin_token_request());
+    let answers: Vec<u8> = (0..rsk_fido::consts::PIN_MISMATCH_LIMIT)
+        .map(|_| exchange_chained(&mut ccid, &wrong).0[0])
+        .collect();
+    assert_eq!(
+        answers.last().copied(),
+        Some(rsk_fido::CtapError::PinAuthBlocked.as_u8()),
+        "the wrong PINs did not engage the lock in RAM: {answers:?}"
+    );
+    assert_eq!(
+        env.board.borrow().pin_locks.last().map(|lock| lock.engaged),
+        Some(true),
+        "the soft lock three wrong PINs engaged over CCID never reached the board"
+    );
+}
+
+/// `credentialManagement { getNextRP }` (§6.8): subcommand 0x03, no params, no token.
+fn get_next_rp() -> Vec<u8> {
+    std::vec![
+        rsk_fido::consts::CTAP_CREDENTIAL_MGMT,
+        0xA1,
+        0x01,
+        rsk_fido::consts::CM_ENUMERATE_RPS_NEXT as u8,
+    ]
+}
+
+/// A getNextRP carries no pinUvAuthParam — its authorization IS the channel whose
+/// Begin opened the walk (§6.8). CCID stamped no channel, so it ran with the last
+/// CTAPHID CID and could take the next leg of a walk a CTAPHID manager had opened,
+/// reading the RP ids that manager's token had bought, having shown none of its own.
+#[test]
+fn a_credmgmt_walk_bound_to_a_ctaphid_channel_is_not_continuable_over_ccid() {
+    // The first CID `rsk_usb::ctaphid::CidAllocator` hands out, so a CCID sentinel set
+    // to any real channel (not just some arbitrary one) would collide with it here.
+    const CHANNEL: u32 = 0x0100_0000;
+    let env = Env::new();
+    let mut ctap = env.ctap();
+    let mut ccid = env.ccid();
+    // FIDO is selected over CCID up front, as a PC/SC session does once: the getNextRP
+    // below is then the first CCID APDU after the walk is bound, so the channel it runs
+    // on has to be stamped BEFORE its dispatch, not swept by the next command's entry.
+    assert_eq!(
+        sw(ccid.handle_apdu(&select(rsk_fido::consts::FIDO_AID), 0)),
+        rsk_sdk::Sw::OK
+    );
+    // A walk enumerateRPsBegin opened on CTAPHID channel CHANNEL, with a leg to serve.
+    {
+        let mut st = env.fido_state.borrow_mut();
+        st.channel = CHANNEL;
+        st.cm.channel = CHANNEL;
+        st.cm.rp_counter = 1;
+        st.cm.rp_total = 1;
+    }
+    // The channel that opened it may take the next leg: the store holds no RP, so the
+    // gate passes and the scan reports NoCredentials rather than refusing the caller.
+    assert_eq!(
+        ctap.handle_cbor(CHANNEL, &get_next_rp(), 0)[0],
+        rsk_fido::CtapError::NoCredentials.as_u8(),
+        "the channel that opened the walk was refused its own next leg"
+    );
+    // Over CCID the same walk must be refused — a smart-card reader is not that channel.
+    let (over_ccid, _) = exchange_chained(&mut ccid, &ctap_msg(&get_next_rp()));
+    assert_eq!(
+        over_ccid[0],
+        rsk_fido::CtapError::NotAllowed.as_u8(),
+        "a credMgmt walk opened on a CTAPHID channel was continued over CCID"
+    );
+}
+
+/// A vendor (0x41) command over CCID must re-apply the LED block that lives outside
+/// flash, as the CTAPHID handler does — else a `rsk led` write over PC/SC takes no
+/// effect until the next reboot.
+#[test]
+fn a_vendor_command_over_ccid_reapplies_the_configuration() {
+    let _phy = crate::tests::PHY_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let env = Env::new();
+    let mut ccid = env.ccid();
+    assert_eq!(
+        sw(ccid.handle_apdu(&select(rsk_fido::consts::FIDO_AID), 0)),
+        rsk_sdk::Sw::OK
+    );
+    exchange_chained(&mut ccid, &ctap_msg(&[rsk_fido::consts::CTAP_VENDOR]));
+    assert_eq!(
+        env.board.borrow().config_written,
+        1,
+        "a 0x41 command over CCID did not re-apply the live configuration"
+    );
+}
+
+/// A phy write over CCID changes the boot-only USB identity, so it must warm-reboot on
+/// the write. Left unhandled, the flag it set was taken by the next unrelated CTAPHID
+/// 0x41 command, rebooting on that one — even an audit read.
+#[test]
+fn a_phy_write_over_ccid_reboots_on_the_write_not_a_later_command() {
+    let _phy = crate::tests::PHY_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let env = Env::new();
+    let phy = rsk_phy::PhyData {
+        presence_timeout: Some(45),
+        ..Default::default()
+    };
+    let mut blob = [0u8; rsk_phy::PHY_MAX_SIZE];
+    let blen = phy.serialize(&mut blob).unwrap();
+    let write = ctap_msg(&crate::tests::vendor_config_write(
+        rsk_fido::consts::CONFIG_TARGET_PHY,
+        &blob[..blen],
+    ));
+    let mut ccid = env.ccid();
+    assert_eq!(
+        sw(ccid.handle_apdu(&select(rsk_fido::consts::FIDO_AID), 0)),
+        rsk_sdk::Sw::OK
+    );
+    exchange_chained(&mut ccid, &write);
+    assert_eq!(
+        env.board.borrow().reboots,
+        1,
+        "a phy write over CCID must warm-reboot on the write"
+    );
+    // The one-shot flag must be gone: a later unrelated CTAPHID 0x41 does not inherit it.
+    let mut ctap = env.ctap();
+    ctap.handle_cbor(1, &[rsk_fido::consts::CTAP_VENDOR], 0);
+    assert_eq!(
+        env.board.borrow().reboots,
+        1,
+        "a later CTAPHID command inherited the phy write's reboot"
     );
 }
 

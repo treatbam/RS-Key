@@ -12,6 +12,8 @@ fn encode_apply_block_roundtrip() {
         sleep_secs: kani::any(),
         pin_declined: kani::any(),
         scramble_pin: kani::any(),
+        haptic_level: kani::any::<u8>() & FLAG_HAPTIC_LEVEL_MASK,
+        mute_pin_haptic: kani::any(),
     };
     let mut got = DisplayConfig::default();
     got.apply_block(&cfg.encode());

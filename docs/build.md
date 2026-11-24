@@ -65,6 +65,12 @@ flowchart TD
 | `DISPLAY_BUS` | `pio` (`spi0` with `DISPLAY_PANEL=ili9341`) | `pio` / `spi0` | **`display` builds only.** The panel's transport. `st7789` only has its PIO link. An `ili9341` takes `pio` when its header lands on pins SPI0 can't use: the panel goes on a PIO1 TX link (`pio_clk`/`pio_data` board keys) with an integer divider at the 160 MHz display clock, and the XPT2046 is bit-banged on `touch_clk`/`touch_din`/`touch_dout`. See `firmware/boards/waveshare-zero-ili9341-stacked.toml` and [hardware.md](hardware.md#stacked-the-zero-soldered-straight-onto-the-modules-header). |
 | `WAKE_PIN` | `25` (`none` with `DISPLAY_PANEL=ili9341`) | `none` or `0..=29` | **`display` builds only.** The button that wakes the panel from display sleep. Default `25` is the Waveshare RP2350-Touch-LCD-2.8's **BAT_PWR** button. `none` makes wake touch-only (no button); any other GPIO selects a different button. A value on a display pin (`10..=18` for `st7789`, the board's panel/touch pins for `ili9341`) is rejected at compile time. The display-sleep timeout itself is set on-device (Settings → Display sleep). |
 | `WAKE_ACTIVE_HIGH` | `0` | `0` / `1` | Wake-button polarity (`display` builds, with a GPIO `WAKE_PIN`). `0` (default) = active-low (internal pull-up, press reads **low**, e.g. BAT_PWR to ground); `1` = active-high (internal pull-down). |
+| `HAPTIC_KIND` | `none` | `none` / `pwm` / `drv2605` | Optional compile-time haptic-feedback backend (also configurable via `[haptic]` `kind` in a board TOML). `none` (default) compiles zero haptic code and claims no pins. `pwm` drives an ERM coin motor via a GPIO PWM output (`HAPTIC_PIN`, default GP26, slice 5 channel A) through an external MOSFET/NPN + flyback diode. `drv2605` drives a TI DRV2605L (`0x5A`) over I2C1 (`HAPTIC_I2C_SDA` / `HAPTIC_I2C_SCL`, default GP14 / GP15) using built-in ROM effects, with the I2C1 bus wrapped in a shared `Mutex` (`haptic::SharedI2c1`) so a future I2C peripheral (e.g. an RTC) can share the pins. Fires a ~18–20 ms pulse on each registered touch, a soft double-pulse cue when the PIN pad opens, and a ~450 ms buzz when a PIN is rejected. See [hardware.md](hardware.md#optional-haptic-feedback-haptic_kind). |
+| `HAPTIC_PIN` | `26` | `0..=29` | **`HAPTIC_KIND=pwm` only** (`[haptic]` `pin`). GPIO driving the PWM haptic transistor gate/base. Must map to the RP2350 PWM slice `(pin >> 1) & 7` and channel A (even GPIO) or B (odd GPIO). Checked at compile time against all display, touch, wake, presence, and LED pins, and its PWM slice is checked against the display backlight slice (`bl_pwm_slice`) and `pimoroni` LED slices (`1` and `2`). |
+| `HAPTIC_PWM_SLICE` / `HAPTIC_PWM_CHANNEL` | derived from `HAPTIC_PIN` (`5` / `A` for GP26) | `0..=7` / `A` or `B` | **`HAPTIC_KIND=pwm` only** (`[haptic]` `pwm_slice` / `pwm_channel`). Optional explicit PWM slice and channel; `build.rs` verifies they match `(HAPTIC_PIN >> 1) & 7` and the pin parity (`A` for even GPIOs, `B` for odd GPIOs) and rejects mismatches or backlight-slice collisions at compile time. |
+| `HAPTIC_ACTUATOR` | `erm` | `erm` / `lra` | **`HAPTIC_KIND=drv2605` only** (`[haptic]` `actuator`). Selects the DRV2605L actuator mode and ROM library: `erm` selects ERM mode (`REG_FEEDBACK = 0x36`, Library A), `lra` selects LRA mode (`REG_FEEDBACK = 0xB6`, Library F). |
+| `HAPTIC_I2C_SDA` / `HAPTIC_I2C_SCL` | `14` / `15` | `14` / `15` (or `none` when `HAPTIC_KIND != drv2605`) | **`HAPTIC_KIND=drv2605` only** (`[haptic]` `i2c_sda` / `i2c_scl`). I2C1 SDA and SCL pins for the DRV2605L driver (GP14/GP15 on the RP2350-Zero, shareable with an RTC). Setting either to `none` or a non-I2C1 pin pair when `HAPTIC_KIND=drv2605`, or colliding with any display/LED/wake/presence pin, fails the build at compile time. |
+| `HAPTIC_I2C_FREQ_HZ` | `400000` | `10000..=1000000` | **`HAPTIC_KIND=drv2605` only** (`[haptic]` `i2c_freq_hz`). I2C1 bus clock in Hz (default 400 kHz Fast Mode). |
 | `LED_KIND` | `ws2812` | `ws2812` / `gpio` / `pimoroni` / `none` | The LED driver backend, and the **boot default**. A non-`none` build compiles all three so the driver/pin/order are runtime-switchable via `rsk hw` / PicoForge (see below). `ws2812` = a single addressable RGB on `LED_PIN` (the Waveshare default). `gpio` = a plain on/off LED on `LED_PIN`. Hue/brightness collapse to lit/unlit, but the blink *pattern* still distinguishes statuses. `pimoroni` = a 3-pin PWM RGB (Pimoroni Tiny 2350: R=GPIO18, G=GPIO19, B=GPIO20, common-anode). `none` = no indicator (the status engine still runs; nothing renders it, and the phy LED fields are ignored). |
 | `LED_ORDER` | `rgb` | `rgb` / `grb` | WS2812 wire byte order (`ws2812` backend only). The Waveshare RP2350-One is unusually `rgb` (the default); standard WS2812B parts (e.g. the TenStar RP2350-USB) are `grb`. If a `ws2812` board comes up with red and green swapped (blue fine), flip this to `grb`. |
 | `MAX_LEDS` | `1` | `1`–`64` | PIO state-machine and frame-buffer ceiling for addressable LEDs. The **actual** connected count is set at runtime via `rsk hw --led-num` and must be ≤ `MAX_LEDS`. Default 1 is a single onboard LED; a board with a chain of N builds with `MAX_LEDS=N` (up to 64).|
@@ -248,85 +254,3 @@ Two caveats:
   `--rollback <your board's floor>`, a separate, deliberate step with its own
   rules and a finite OTP budget. Don't add it blindly; the full
   flashing-with-rollback workflow is in [anti-rollback.md](anti-rollback.md).
-- **The env knobs above are declarative Nix args**, not ambient env. A plain
-  `nix build` bakes the defaults; to customize, pass them to the builder. For a
-  config you reuse, add a one-line preset package (the flake ships
-  `firmware-pico = mkFirmware { name = "firmware-pico"; vidpid = "Pico"; }` as a
-  copy-me example) and build it:
-  ```sh
-  nix build .#firmware-pico
-  ```
-  For a one-off without committing a package, call the exposed builder. (The
-  `--impure` here only lets `getFlake` read the working tree; the knobs
-  themselves are pure. A committed/pushed flakeref needs no flag.)
-  ```sh
-  nix build --impure --expr \
-    '(builtins.getFlake (toString ./.)).lib.${builtins.currentSystem}.mkFirmware
-       { name = "fw"; vidpid = "Nitro3"; fwVersion = "2.0.0"; }'
-  ```
-  Knobs: `vidpid`, `usbVid`, `usbPid`, `fwVersion`, `xoscDelayMult`, `flashSize`,
-  `ledPin`, `presencePin`, `fakeMkek`, `fakeDevk` (mirroring the env vars above). As a convenience each also falls
-  back to the like-named env var, so `VIDPID=Pico nix build --impure .#firmware`
-  works for a quick throwaway, but the declarative arg is the reproducible path
-  and needs no `--impure`.
-
-## `nix run` — host tools without the dev shell
-
-The host tooling is also exposed as flake apps, so it runs straight from the
-flake without `nix develop` (Nix pins every dependency):
-
-```sh
-nix run .#rsk -- status          # the Python device CLI (rsk --help for groups)
-nix run .#rsk-tui                # the live ratatui dashboard (prebuilt binary)
-nix run .#flash -- --help        # build + sign + flash, one command (secure boot)
-```
-
-`#rsk` wraps the bundled `tools/rsk` package on the pinned interpreter; `#rsk-tui`
-is a prebuilt host binary (no compile-on-run). Both are also buildable as
-packages (`nix build .#rsk-tui`).
-
-**`nix run .#flash`** wraps the secure-boot flash ritual end to end: it seals
-(signs) an unsigned image, reboots the device into BOOTSEL, loads it, then
-reboots. With no argument it seals the reproducible default firmware
-(`.#firmware`); pass a path to seal a flavor you built yourself
-(`nix run .#flash -- firmware-no-touch.uf2`). It reads the signing key from the
-host (`~/.rs-key-secrets/{secure_boot_key.pem,otp_secureboot.json}` by default,
-override the directory with `RS_KEY_SECRETS`) and stamps `--rollback 1` into the
-seal (set `RSK_ROLLBACK` to change). It prompts before flashing (`-y` skips). The
-device must already run secure boot with the matching boot key provisioned; the
-full ritual, the anti-rollback rules, and recovery are in
-[production.md](production.md) and [anti-rollback.md](anti-rollback.md).
-
-## Runtime overrides (phy record)
-
-The rescue applet can store a small config record in flash (`rsk` /
-`rsk-tui` expose the safe fields). At boot, a stored **VID/PID** and **product
-string** override the compile-time defaults, useful to re-identify a device
-without rebuilding. A bad value can make the device enumerate strangely;
-recovery is a BOOTSEL reflash (which never reads the record) or rewriting the
-record over CCID.
-
-The effective identity is resolved in this order:
-
-```mermaid
-flowchart TD
-    a["VIDPID preset"] --> b["USB_VID / USB_PID raw override (compile time)"]
-    b --> c["phy record (runtime, at boot)"]
-    c --> d["effective VID/PID + product string"]
-```
-
-## Notes
-
-- The PC/SC **reader name** comes from the USB strings. The default build reads
-  `RS-Key RS-Key Security Key …`, and the project's own tools (`rsk`, `rsk-tui`)
-  match the `RS-Key` token. `ykman` and Yubico Authenticator derive the device's
-  PID *purely from that name*. They need the `Yubico YubiKey` words and the
-  `OTP`/`FIDO`/`CCID` tokens, which only the opt-in `VIDPID=Yubikey5` flavor
-  supplies (`Yubico YubiKey RSK OTP+FIDO+CCID`); on the default build those tools
-  do not see the device. `gpg`, `ssh -sk`, browsers, libfido2 and OpenSC are
-  identity-independent and work on either build.
-- `bcdDevice` (USB device release) is an internal build counter, not the
-  firmware version.
-- The two UF2 flavors on a release build of this repo:
-  `firmware.uf2` (touch) and `firmware-test.uf2` (no-touch). `scripts/check.sh`
-  builds both.

@@ -31,18 +31,20 @@ pub use render::{
     render_add_passkey, render_apps, render_audit_log, render_audit_page, render_backup,
     render_backup_format, render_confirm_delete, render_confirm_factory_reset, render_erasing,
     render_firmware, render_hold_button, render_hold_fill, render_home_change,
-    render_locked_breathe, render_oath, render_oath_cred, render_oath_page, render_openpgp,
-    render_openpgp_cardholder, render_openpgp_key, render_passkeys_list, render_passkeys_page,
-    render_pin_blocked, render_pin_dots, render_pin_title, render_piv, render_piv_extra,
-    render_piv_extra_page, render_piv_keygen_confirm, render_piv_keygen_pick,
+    render_locked_breathe, render_oath, render_oath_cred, render_oath_cred_code, render_oath_page,
+    render_openpgp, render_openpgp_cardholder, render_openpgp_key, render_passkeys_list,
+    render_passkeys_page, render_pin_blocked, render_pin_dots, render_pin_title, render_piv,
+    render_piv_extra, render_piv_extra_page, render_piv_keygen_confirm, render_piv_keygen_pick,
     render_piv_keygen_rsa_pick, render_piv_keygen_working, render_piv_pin_menu,
     render_piv_protect_confirm, render_piv_slot, render_rebooting, render_rename,
     render_rename_field, render_rename_keys, render_reveal_warning, render_seal_confirm,
     render_seed_phrase, render_service, render_service_page, render_share_picker,
     render_slip39_share, render_status_arc, render_success, render_success_circle,
-    render_wipe_failed,
+    render_touch_cal_target, render_wipe_failed,
 };
-pub use settings_store::{CONF_LEN as DISPLAY_CONF_LEN, DisplayConfig};
+pub use settings_store::{
+    CONF_LEN as DISPLAY_CONF_LEN, DisplayConfig, TOUCH_CAL_LEN, decode_touch_cal, encode_touch_cal,
+};
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
 pub const PANEL_W: u16 = 240;
@@ -600,6 +602,9 @@ pub enum SettingsPage {
     /// Display-sleep timeout adjust (−/+/Back) — blanks the panel after inactivity to
     /// stop image retention on the IPS glass.
     Sleep,
+    /// The Haptics sub-page (reached from Settings → Display → Haptics): intensity level,
+    /// PIN-pad click mute toggle, and the test-cues trigger.
+    Haptics,
     /// The Security sub-page: the device, FIDO and PIV PINs, the PIN-pad scramble toggle,
     /// the audit log, the backup status, and the (danger) Factory reset. Reached from the
     /// Root "Security" row; the title-bar back chevron returns to Root.
@@ -609,12 +614,42 @@ pub enum SettingsPage {
 /// Discrete backlight steps the brightness page cycles through (1 = dimmest kept on,
 /// never 0 — the menu never blanks the panel you're navigating).
 pub const BRIGHTNESS_LEVELS: u8 = 5;
+/// Haptic intensity level: Off (`0`).
+pub const HAPTIC_LEVEL_OFF: u8 = 0;
+/// Haptic intensity level: Low (`1`).
+pub const HAPTIC_LEVEL_LOW: u8 = 1;
+/// Haptic intensity level: Medium (`2`, the shipped default).
+pub const HAPTIC_LEVEL_MEDIUM: u8 = 2;
+/// Haptic intensity level: High (`3`).
+pub const HAPTIC_LEVEL_HIGH: u8 = 3;
+/// Default haptic intensity level (`2` = Medium).
+pub const HAPTIC_LEVEL_DEFAULT: u8 = HAPTIC_LEVEL_MEDIUM;
 /// Touch-timeout choices in seconds the timeout page steps between.
 pub const TIMEOUT_CHOICES: [u16; 5] = [10, 20, 30, 60, 120];
 /// Display-sleep choices in seconds the sleep page steps between; the final `0` is the
 /// "Off" sentinel (never blank). Kept ascending by wake-awake time so `+` lengthens it
 /// up to Off.
 pub const SLEEP_CHOICES: [u16; 6] = [15, 30, 60, 120, 300, 0];
+
+/// Human-readable label for a haptic intensity level (`0..=3`).
+pub const fn haptic_level_label(level: u8) -> &'static str {
+    match level {
+        HAPTIC_LEVEL_OFF => "Off",
+        HAPTIC_LEVEL_LOW => "Low",
+        HAPTIC_LEVEL_MEDIUM => "Medium",
+        _ => "High",
+    }
+}
+
+/// Cycle the haptic intensity level (`Medium -> High -> Off -> Low -> Medium`) on a row tap.
+pub const fn cycle_haptic_level(level: u8) -> u8 {
+    match level {
+        HAPTIC_LEVEL_OFF => HAPTIC_LEVEL_LOW,
+        HAPTIC_LEVEL_LOW => HAPTIC_LEVEL_MEDIUM,
+        HAPTIC_LEVEL_MEDIUM => HAPTIC_LEVEL_HIGH,
+        _ => HAPTIC_LEVEL_OFF,
+    }
+}
 
 /// The settings view model: the current page plus the live values its pages show.
 /// Carried in [`Screen::Settings`] so the renderer paints the current brightness
@@ -643,6 +678,10 @@ pub struct SettingsView {
     pub backup_sealed: bool,
     /// Whether the PIN pad scrambles its digits — the Security page's row shows On / Off.
     pub scramble_pin: bool,
+    /// Haptic intensity level (`0` = Off, `1` = Low, `2` = Medium, `3` = High).
+    pub haptic_level: u8,
+    /// Whether haptic touch clicks are muted while the on-screen PIN pad is open.
+    pub mute_pin_haptic: bool,
 }
 
 /// An entry on the settings Root list — the three domains, in display order.
@@ -671,6 +710,21 @@ pub enum DisplayEntry {
     /// Touch / presence-confirm timeout — how long a touch request waits for a tap (and how
     /// long a revealed PIN stays lit).
     Timeout,
+    /// Haptic feedback settings (intensity level, PIN-pad click mute, test cues).
+    Haptics,
+    /// Guided 3-point + center verification touch screen calibration.
+    CalibrateTouch,
+}
+
+/// An entry on the Haptics sub-page list (Settings → Display → Haptics).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HapticsEntry {
+    /// Cycle haptic intensity (`Off` / `Low` / `Medium` / `High`).
+    Level,
+    /// Toggle haptic touch clicks while the on-screen PIN pad is open (`On` / `Off`).
+    PinClicks,
+    /// Play all three haptic cues in sequence (touch click → PIN prompt → PIN error).
+    TestCues,
 }
 
 /// An entry on the Security sub-page list.
@@ -738,16 +792,18 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
     }
 }
 
-/// Number of Display sub-page rows (Brightness / Display sleep / Touch timeout).
-pub const DISPLAY_ROWS: u16 = 3;
+/// Number of Display sub-page rows (Brightness / Display sleep / Touch timeout / Haptics /
+/// Calibrate touch).
+pub const DISPLAY_ROWS: u16 = 5;
 
-/// The Display entry on row `i`, in list order (the two screen-output knobs first, then the
-/// touch timeout).
+/// The Display entry on row `i`, in list order.
 pub const fn display_row_entry(i: u16) -> DisplayEntry {
     match i {
         0 => DisplayEntry::Brightness,
         1 => DisplayEntry::Sleep,
-        _ => DisplayEntry::Timeout,
+        2 => DisplayEntry::Timeout,
+        3 => DisplayEntry::Haptics,
+        _ => DisplayEntry::CalibrateTouch,
     }
 }
 
@@ -758,6 +814,31 @@ pub fn hit_display(p: Point) -> Option<DisplayEntry> {
     while i < DISPLAY_ROWS {
         if settings_row_rect(i).contains(p) {
             return Some(display_row_entry(i));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Number of Haptics sub-page rows (Intensity / PIN pad clicks / Test cues).
+pub const HAPTICS_ROWS: u16 = 3;
+
+/// The Haptics entry on row `i`, in list order.
+pub const fn haptics_row_entry(i: u16) -> HapticsEntry {
+    match i {
+        0 => HapticsEntry::Level,
+        1 => HapticsEntry::PinClicks,
+        _ => HapticsEntry::TestCues,
+    }
+}
+
+/// Which Haptics entry, if any, a tap at `p` selects. Reuses [`settings_row_rect`] for the
+/// first [`HAPTICS_ROWS`] rows (disjoint by construction).
+pub fn hit_haptics(p: Point) -> Option<HapticsEntry> {
+    let mut i = 0;
+    while i < HAPTICS_ROWS {
+        if settings_row_rect(i).contains(p) {
+            return Some(haptics_row_entry(i));
         }
         i += 1;
     }
@@ -815,7 +896,11 @@ const _: () = {
     assert!(ROW_GAP > 0);
     // At least one brightness step (the level-bar math would underflow at 0).
     assert!(BRIGHTNESS_LEVELS >= 1);
-    assert!(SETTINGS_ROWS <= SECURITY_ROWS && DISPLAY_ROWS <= SECURITY_ROWS);
+    assert!(
+        SETTINGS_ROWS <= SECURITY_ROWS
+            && DISPLAY_ROWS <= SECURITY_ROWS
+            && HAPTICS_ROWS <= SECURITY_ROWS
+    );
     // The settings sub-pages (Display / Security) are no-nav — a back chevron, no bottom
     // nav bar — so the longest list (Security) is bounded by the panel bottom, not NAV_TOP.
     // The Root settings list IS a nav tab, so it must still clear the nav bar.
@@ -1800,8 +1885,23 @@ pub struct OathRow {
     pub touch: bool,
 }
 
+/// The live TOTP code / tap-to-reveal card on [`render_oath_cred`], below the 5-row detail
+/// card (`y = 82..240`).
+pub const OATH_CODE_CARD_RECT: Rect = Rect::new(13, 246, PANEL_W - 26, 62);
+
+const _: () = {
+    assert!(OATH_CODE_CARD_RECT.y > CONTENT_TOP + 28 + 5 * 30 + 8);
+    assert!(OATH_CODE_CARD_RECT.x + OATH_CODE_CARD_RECT.w <= PANEL_W);
+    assert!(OATH_CODE_CARD_RECT.y + OATH_CODE_CARD_RECT.h <= PANEL_H);
+};
+
+/// Did a tap at `p` hit the OATH detail screen's tap-to-reveal code card?
+pub fn hit_oath_reveal(p: Point) -> bool {
+    OATH_CODE_CARD_RECT.contains(p)
+}
+
 /// One OATH credential's detail (back-only): type, HMAC algorithm, digit count, TOTP
-/// step and touch gate. No code is computed (the device has no clock for TOTP).
+/// step, touch gate, and optional RTC-backed live TOTP code.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct OathDetailView {
     pub name: Label,
@@ -1811,6 +1911,13 @@ pub struct OathDetailView {
     /// TOTP step in seconds; `0` for HOTP (counter-based).
     pub period: u16,
     pub touch: bool,
+    /// Whether the hardware RTC has a valid wall-clock time (`true` when DS3231 is set).
+    pub clock_set: bool,
+    /// Live TOTP code (`0..10^digits`) when `clock_set && !hotp` and either `!touch` or
+    /// the user tapped to reveal. `None` when `hotp`, `!clock_set`, or waiting for touch.
+    pub code: Option<u32>,
+    /// Seconds remaining in the current TOTP window (`1..=period`) when `code.is_some()`.
+    pub remaining_secs: u8,
 }
 
 /// Top-level screen the display task renders. The three top-level **tabs** (Home,

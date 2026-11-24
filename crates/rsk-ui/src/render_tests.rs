@@ -665,6 +665,9 @@ fn applet_detail_screens_fit_and_clip_max_values() {
             digits: 6,
             period: 30,
             touch: false,
+            clock_set: true,
+            code: Some(482_910),
+            remaining_secs: 17,
         },
     )
     .unwrap();
@@ -1406,6 +1409,8 @@ fn view(page: SettingsPage) -> SettingsView {
         fido_pin_set: true,
         backup_sealed: true,
         scramble_pin: false,
+        haptic_level: crate::HAPTIC_LEVEL_DEFAULT,
+        mute_pin_haptic: false,
     }
 }
 
@@ -1417,6 +1422,7 @@ fn every_settings_page_fits_and_draws() {
         SettingsPage::Brightness,
         SettingsPage::Timeout,
         SettingsPage::Sleep,
+        SettingsPage::Haptics,
         SettingsPage::Security,
     ] {
         let mut d = Rec::new();
@@ -2169,6 +2175,9 @@ fn applet_screens_paint_inside_the_panel() {
             digits: 6,
             period: 30,
             touch: true,
+            clock_set: true,
+            code: None,
+            remaining_secs: 0,
         },
     )
     .unwrap();
@@ -2183,6 +2192,7 @@ fn applet_screens_paint_inside_the_panel() {
             digits: 8,
             period: 0,
             touch: false,
+            ..Default::default()
         },
     )
     .unwrap();

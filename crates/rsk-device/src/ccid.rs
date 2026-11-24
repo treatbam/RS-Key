@@ -378,6 +378,15 @@ impl<'a, S: Storage, R: rsk_sdk::Rng + 'static, VP: rsk_vendor::Platform>
         // clock and the enabled-applications mask — are stamped on here, one
         // dispatch before they are read.
         self.fido.stamp(now_ms, self.enabled_caps);
+        // FIDO runs here too, over the `FidoState` the CTAPHID handler shares, so the
+        // panel's one-shot clientPIN signal is taken here as well: the token it ends
+        // must not survive into the next command on either transport.
+        crate::reset_token_on_local_pin_change(self.hooks, self.fido.state, self.rng);
+        // CCID has no CTAPHID channel, so its FIDO commands run on the reserved id 0
+        // (`rsk_usb::ctaphid::CidAllocator` never hands it out): a credMgmt walk, a
+        // getNextAssertion or an MSE key one transport opened is not continuable from it.
+        const CCID_NO_CHANNEL: u32 = 0;
+        self.fido.state.borrow_mut().channel = CCID_NO_CHANNEL;
         // The keygen fast paths bypass `Dispatcher::process`, so the class byte it
         // judges has to be judged ahead of them: a chaining segment is not a command
         // yet, and a secure-messaging class is refused. Falling through is what
@@ -419,7 +428,16 @@ impl<'a, S: Storage, R: rsk_sdk::Rng + 'static, VP: rsk_vendor::Platform>
             let sw = self.disp.process(apdu, &mut applets, &mut *fsb, &mut res);
             (sw, res.len())
         };
+        // The FIDO applet spends clientPIN attempts here too, and the vendor and rescue
+        // applets serve an ungated warm reboot on this same interface.
+        crate::persist_pin_lock(self.hooks, self.fido.state);
         self.resp[n..n + 2].copy_from_slice(&sw.to_bytes());
+        // A vendor (0x41) CBOR command over CCID persists EF_LED_CONF / EF_PHY like it
+        // does over CTAPHID; re-apply the live LED block and any phy reboot the same way.
+        // A config write is one short APDU, so testing the raw APDU needs no reassembly.
+        if sw == Sw::OK && Apdu::parse(apdu).is_ok_and(|p| crate::ccid_fido::is_vendor_cbor(&p)) {
+            crate::apply_vendor_config(self.hooks, self.fs);
+        }
         &self.resp[..n + 2]
     }
 

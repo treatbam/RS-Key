@@ -7,10 +7,10 @@ contained. Adding a new `unsafe` requires updating this page. (Safe Rust rules
 out memory-corruption bugs in this code. It is not a security audit; see the
 [threat model](threat-model.md).)
 
-**Runtime sites: 29.** Nineteen in the firmware proper (`main.rs` + `presence.rs`
+**Runtime sites: 31.** Twenty-one in the firmware proper (`main.rs` + `presence.rs`
 + `display_panel.rs`): the interrupt-handler pair (2), the `Send` impl, the heap
-init, and the fifteen GPIO-pin `steal`s (the presence button, the LED power-enable
-rail, the nuisance USR LED, the display build's wake button, and — display builds
+init, and the seventeen GPIO/peripheral `steal`s (the presence button, the LED power-enable
+rail, the nuisance USR LED, the display build's wake button, the optional PWM or DRV2605L I2C1 haptic driver pins/peripherals, and — display builds
 only — the panel's CS/DC/RST/TP_RST control lines, the ILI9341 flavor's SPI0/touch
 pins and its backlight pad, and the PIO link's by-number pin steal with its
 callers, the PIO-bus ILI9341's touch pins and its slice-2 backlight). Three for the per-core prime sieves and one
@@ -23,7 +23,7 @@ flowchart TB
       a["interrupt executor (×2)"]
       b["Send for SendUsb"]
       c["heap init"]
-      d["GPIO pin steal ×15 (presence, LED power, USR LED, display wake + CS/DC/RST/TP_RST, ILI9341 bus/touch + backlight, PIO link pins)"]
+      d["GPIO/peripheral steal ×17 (presence, LED power, USR LED, display wake + CS/DC/RST/TP_RST, ILI9341 bus/touch + backlight, PIO link pins, haptic PWM/I2C1)"]
       d2["core0 stack limit (MSPLIM)"]
     end
     subgraph kg["firmware/src/core1.rs"]
@@ -87,7 +87,7 @@ static buffer used by nothing else.
 *Safe alternative:* none; every embedded allocator initializes this way.
 *Containment:* one call, before any allocation can happen.
 
-### 5–19. GPIO pin type-erasure (presence button, LED power rail, USR-LED-off, display wake + control pins, ILI9341 bus/touch + backlight, PIO link pins, ×15) — `PLAT-UNSAFE-004`
+### 5–21. GPIO pin type-erasure (presence button, LED power rail, USR-LED-off, display wake + control pins, ILI9341 bus/touch + backlight, PIO link pins, haptic PWM/I2C1, ×17) — `PLAT-UNSAFE-004`
 
 ```rust
 let any = unsafe { AnyPin::steal(pin) };
@@ -156,9 +156,25 @@ each other, every panel/touch pin, I2C1 (2.8″ board), an enabled `WAKE_PIN`,
 phy-written LED pin at boot; a slice-1/2 backlight refuses `LED_KIND=pimoroni` at
 compile time and a phy-written pimoroni driver at boot.
 
+The optional haptic backends (`HAPTIC_KIND=pwm` and `HAPTIC_KIND=drv2605`) add one
+block each in `main.rs`: the `pwm` arm steals the typed `PIN_n` and `PWM_SLICEm`
+selected by `HAPTIC_PIN`, and the `drv2605` arm steals `I2C1` together with its
+typed `PIN_n` SDA/SCL pair (`HAPTIC_I2C_SDA`/`HAPTIC_I2C_SCL`).
+*Safe alternative:* none — the LED block's runtime `match` over `p.PIN_0..=PIN_29`
+and `p.PWM_SLICE1/2` (and the ST7789 display block's `p.I2C1`) may already move
+those peripherals out of `p` in another arm.
+*Containment:* compile-time `assert!`s in `build.rs` and `main.rs` reject any
+collision between `HAPTIC_PIN` (or `HAPTIC_I2C_SDA`/`HAPTIC_I2C_SCL`) and the
+display control/bus/touch pins, `WAKE_PIN`, `PRESENCE_PIN`, `USR_LED_PIN`,
+`LED_PIN`, `LED_POWER_PIN`, or the pimoroni LED pins, reject a `HAPTIC_PWM_SLICE`
+collision with the display backlight slice or pimoroni PWM slices 1/2, and refuse
+`HAPTIC_KIND=drv2605` on the ST7789 display flavor (which already owns `I2C1`);
+at runtime the phy filter drops a host-written `led_gpio` or `pimoroni` driver that
+would collide with the active haptic pin or PWM slice.
+
 ## Firmware dual-core keygen (`firmware/src/core1.rs`)
 
-### 20–22. The per-core prime sieves — `PLAT-UNSAFE-005`
+### 22–24. The per-core prime sieves — `PLAT-UNSAFE-005`
 
 ```rust
 static mut CORE0_SIEVE: IncrementalSieve = IncrementalSieve::new();
@@ -190,7 +206,7 @@ on core0; the partition (which core touches which sieve) is structural, and the 
 a candidate, scrubbed at the top of every keygen). A wrong residue can only let
 a composite through to the strong-MR/Lucas test, which still rejects it.
 
-### 23–24. The per-core stack limits (`main.rs`, `core1.rs`) — `PLAT-UNSAFE-006`
+### 25–26. The per-core stack limits (`main.rs`, `core1.rs`) — `PLAT-UNSAFE-006`
 
 ```rust
 unsafe { cortex_m::register::msplim::write(&raw const _stack_end as u32) }; // core0, entering `main`
@@ -225,7 +241,7 @@ issued by the routine that is at that moment generating and storing a key.
 
 ## RSA assembly FFI (`crates/rsk-rsa/src/lib.rs`)
 
-### 25–27. The modexp / CRT-sign calls — `PLAT-UNSAFE-007`
+### 27–29. The modexp / CRT-sign calls — `PLAT-UNSAFE-007`
 
 On-card RSA key generation needs hundreds of modular exponentiations over
 1024–2048-bit candidates. The pure-Rust path was ~7× too slow on the
@@ -244,7 +260,7 @@ all host tests exercise the same API safely.
 
 ## Flash wiper (`rsk-wipe/src/main.rs`)
 
-### 28–29. Raw flash erase/program in a critical section — `PLAT-UNSAFE-008`
+### 30–31. Raw flash erase/program in a critical section — `PLAT-UNSAFE-008`
 
 The wiper's entire job is to erase the flash the firmware lives on, from a
 RAM-resident image. It calls the ROM flash-erase/program routines inside

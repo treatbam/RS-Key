@@ -12,7 +12,7 @@ use embassy_rp::peripherals::SPI0;
 #[cfg(display_bus = "spi0")]
 use embassy_rp::spi::{Async, Spi};
 use rsk_display::TouchPad;
-use rsk_ui::touch::{TouchDebounce, XPT2046_SAMPLES, Xpt2046Cal, xpt2046_point};
+use rsk_ui::touch::{TouchDebounce, XPT2046_SAMPLES, Xpt2046Cal, xpt2046_point, xpt2046_raw};
 
 #[cfg(display_bus = "spi0")]
 use super::SharedSpi;
@@ -32,13 +32,18 @@ const TOUCH_SPI_HZ: u32 = 2_000_000;
 #[cfg(display_bus = "pio")]
 const HALF_BIT_CYCLES: u32 = crate::BUILD_DISPLAY_SYS_CLOCK_HZ / (2 * TOUCH_SPI_HZ);
 
-const CAL: Xpt2046Cal = Xpt2046Cal {
+const DEFAULT_CAL: Xpt2046Cal = Xpt2046Cal {
     x_min: crate::BUILD_DISPLAY_TOUCH_X_MIN,
     x_max: crate::BUILD_DISPLAY_TOUCH_X_MAX,
     y_min: crate::BUILD_DISPLAY_TOUCH_Y_MIN,
     y_max: crate::BUILD_DISPLAY_TOUCH_Y_MAX,
     swap_xy: crate::BUILD_DISPLAY_TOUCH_SWAP_XY,
 };
+
+/// Consecutive `None` samples required to re-arm the rising-edge haptic click
+/// after a registered touch contact, so a single noisy ADC dropout during a
+/// finger hold never fires a spurious second click.
+const RELEASE_READS_TO_REARM: u8 = 3;
 
 /// The touch controller's chip-select and active-low PENIRQ, plus the shared bus.
 #[cfg(display_bus = "spi0")]
@@ -103,6 +108,9 @@ impl TouchLink for BitBang<'_> {
 pub struct Touch {
     hw: TouchHw,
     debounce: TouchDebounce,
+    cal: Xpt2046Cal,
+    down: bool,
+    up_streak: u8,
 }
 
 impl Touch {
@@ -111,6 +119,9 @@ impl Touch {
         let mut touch = Self {
             hw,
             debounce: TouchDebounce::default(),
+            cal: DEFAULT_CAL,
+            down: false,
+            up_streak: RELEASE_READS_TO_REARM,
         };
         touch.with_bus(|spi| {
             convert(spi, CMD_ARM_PENIRQ);
@@ -146,19 +157,23 @@ impl Touch {
         Some(r)
     }
 
-    fn sample(&mut self) -> Option<rsk_ui::Point> {
+    fn read_burst(&mut self) -> Option<(u16, u16, [u16; XPT2046_SAMPLES], [u16; XPT2046_SAMPLES])> {
         if self.hw.irq.is_high() {
             return None;
         }
-        let (z1, z2, xs, ys) = self.with_bus(|spi| {
+        self.with_bus(|spi| {
             let z1 = convert(spi, CMD_Z1);
             let z2 = convert(spi, CMD_Z2);
             let xs = burst(spi, CMD_X);
             let ys = burst(spi, CMD_Y);
             convert(spi, CMD_ARM_PENIRQ);
             (z1, z2, xs, ys)
-        })?;
-        xpt2046_point(z1, z2, xs, ys, &CAL)
+        })
+    }
+
+    fn sample(&mut self) -> Option<rsk_ui::Point> {
+        let (z1, z2, xs, ys) = self.read_burst()?;
+        xpt2046_point(z1, z2, xs, ys, &self.cal)
     }
 }
 
@@ -179,8 +194,50 @@ fn burst(spi: &mut dyn TouchLink, cmd: u8) -> [u16; XPT2046_SAMPLES] {
 
 impl TouchPad for Touch {
     /// One debounced sample: a contact is reported once two reads in a row agree.
+    /// Fires one non-blocking haptic pulse on the rising edge of each registered
+    /// touch, requiring [`RELEASE_READS_TO_REARM`] consecutive released samples
+    /// before re-arming so a single noisy ADC read mid-hold never double-clicks.
     fn read(&mut self) -> Option<rsk_ui::Point> {
         let sample = self.sample();
-        self.debounce.update(sample)
+        let pt = self.debounce.update(sample);
+        if pt.is_some() {
+            self.up_streak = 0;
+            if !self.down {
+                self.down = true;
+                crate::haptic::pulse_touch();
+            }
+        } else {
+            self.up_streak = self.up_streak.saturating_add(1);
+            if self.up_streak >= RELEASE_READS_TO_REARM {
+                self.down = false;
+            }
+        }
+        pt
+    }
+
+    fn read_raw(&mut self) -> Option<(u16, u16)> {
+        let (z1, z2, xs, ys) = self.read_burst()?;
+        let raw = xpt2046_raw(z1, z2, xs, ys);
+        if raw.is_some() {
+            self.up_streak = 0;
+            if !self.down {
+                self.down = true;
+                crate::haptic::pulse_touch();
+            }
+        } else {
+            self.up_streak = self.up_streak.saturating_add(1);
+            if self.up_streak >= RELEASE_READS_TO_REARM {
+                self.down = false;
+            }
+        }
+        raw
+    }
+
+    fn calibration(&self) -> Option<Xpt2046Cal> {
+        Some(self.cal)
+    }
+
+    fn set_calibration(&mut self, cal: Xpt2046Cal) {
+        self.cal = cal;
     }
 }

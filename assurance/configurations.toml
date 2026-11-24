@@ -373,9 +373,11 @@ knob_delta = [
   "display.touch_irq=11", "display.touch_swap_xy=False",
   "display.touch_x_max=300", "display.touch_x_min=3800",
   "display.touch_y_max=300", "display.touch_y_min=3800",
-  "flash.kvmain_kb=1408", "flash.size_mb=4", "led.kind=ws2812",
-  "led.order=rgb", "led.pin=16", "presence.source=bootsel",
-  "usb.vidpid=RSKey",
+  "flash.kvmain_kb=1408", "flash.size_mb=4", "haptic.actuator=erm",
+  "haptic.i2c_freq_hz=400000", "haptic.i2c_scl=15", "haptic.i2c_sda=14",
+  "haptic.kind=none", "haptic.pin=26", "haptic.pwm_channel=A",
+  "haptic.pwm_slice=5", "led.kind=ws2812", "led.order=rgb", "led.pin=16",
+  "presence.source=bootsel", "usb.vidpid=RSKey",
 ]
 disposition = "equivalent"
 basis = "same-cargo-features"

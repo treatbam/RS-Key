@@ -17,10 +17,11 @@ pub(super) fn settings<D: DrawTarget<Color = Rgb565>>(
 ) -> Result<(), D::Error> {
     match v.page {
         SettingsPage::Root => settings_root(t, v.version),
-        SettingsPage::Display => settings_display(t),
+        SettingsPage::Display => settings_display(t, v.haptic_level),
         SettingsPage::Brightness => settings_brightness(t, v.brightness),
         SettingsPage::Timeout => settings_timeout(t, v.timeout_secs),
         SettingsPage::Sleep => settings_sleep(t, v.sleep_secs),
+        SettingsPage::Haptics => settings_haptics(t, v.haptic_level, v.mute_pin_haptic),
         SettingsPage::Security => settings_security(
             t,
             v.device_pin_set,
@@ -68,10 +69,12 @@ fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D, version: u16) -> Resu
     render_nav(t, NavTab::Settings)
 }
 
-/// The Display sub-page: the three panel/interaction knobs — Brightness, Display sleep, and
-/// the Touch timeout — each drilling into its −/+ adjust page (which backs out to here). The
-/// title-bar back chevron returns to the Root list; no nav (a sub-page).
-fn settings_display<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
+/// The Display sub-page: the panel/interaction knobs — Brightness, Display sleep, Touch timeout,
+/// Haptics, and Calibrate touch. The title-bar back chevron returns to the Root list; no nav.
+fn settings_display<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    haptic_level: u8,
+) -> Result<(), D::Error> {
     status_bar(t)?;
     title_bar(t, "Display", theme::ACCENT, true)?;
     // Row order must match [`crate::display_row_entry`] — paint and tap-dispatch share
@@ -102,7 +105,162 @@ fn settings_display<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::E
         "Touch timeout",
         None,
         true,
+    )?;
+    components::rect_card(t, settings_row_rect(3))?;
+    components::rect_row(
+        t,
+        settings_row_rect(3),
+        Glyph::Gear,
+        "Haptics",
+        Some((
+            crate::haptic_level_label(haptic_level),
+            if haptic_level == crate::HAPTIC_LEVEL_OFF {
+                theme::MUTED
+            } else {
+                theme::FAINT
+            },
+        )),
+        true,
+    )?;
+    components::rect_card(t, settings_row_rect(4))?;
+    components::rect_row(
+        t,
+        settings_row_rect(4),
+        Glyph::Edit,
+        "Calibrate touch",
+        None,
+        true,
     )
+}
+
+/// The Haptics sub-page (Settings → Display → Haptics): cycle intensity level (`Off` / `Low` /
+/// `Medium` / `High`), toggle PIN-pad touch clicks (`On` / `Off` for acoustic privacy during
+/// PIN entry), or play all three haptic cues in sequence.
+fn settings_haptics<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    haptic_level: u8,
+    mute_pin_haptic: bool,
+) -> Result<(), D::Error> {
+    status_bar(t)?;
+    title_bar(t, "Haptics", theme::ACCENT, true)?;
+    // Row order must match [`crate::haptics_row_entry`].
+    components::rect_card(t, settings_row_rect(0))?;
+    components::rect_row(
+        t,
+        settings_row_rect(0),
+        Glyph::Gear,
+        "Intensity",
+        Some((
+            crate::haptic_level_label(haptic_level),
+            if haptic_level == crate::HAPTIC_LEVEL_OFF {
+                theme::MUTED
+            } else {
+                theme::OK
+            },
+        )),
+        false,
+    )?;
+    components::rect_card(t, settings_row_rect(1))?;
+    components::rect_row(
+        t,
+        settings_row_rect(1),
+        Glyph::Lock,
+        "PIN pad clicks",
+        Some(if mute_pin_haptic {
+            ("Off", theme::MUTED)
+        } else {
+            ("On", theme::OK)
+        }),
+        false,
+    )?;
+    components::rect_card(t, settings_row_rect(2))?;
+    components::rect_row(
+        t,
+        settings_row_rect(2),
+        Glyph::Check,
+        "Test cues",
+        None,
+        true,
+    )
+}
+
+/// Guided 3-point + center-verification touch calibration screen. Paints a crosshair at
+/// `target` (`step` 0..=2 are the three corner targets; `step == 3` is the center verification
+/// target) and instructions clear of the crosshair.
+pub fn render_touch_cal_target<D>(t: &mut D, step: u8, target: Point) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    let tx = target.x as i32;
+    let ty = target.y as i32;
+    let x0 = (tx - 12).max(0);
+    let x1 = (tx + 12).min(PANEL_W as i32 - 1);
+    let y0 = (ty - 12).max(0);
+    let y1 = (ty + 12).min(PANEL_H as i32 - 1);
+    Line::new(EgPoint::new(x0, ty), EgPoint::new(x1, ty))
+        .into_styled(PrimitiveStyle::with_stroke(theme::ACCENT, 1))
+        .draw(t)?;
+    Line::new(EgPoint::new(tx, y0), EgPoint::new(tx, y1))
+        .into_styled(PrimitiveStyle::with_stroke(theme::ACCENT, 1))
+        .draw(t)?;
+    Rectangle::new(
+        EgPoint::new((tx - 2).max(0), (ty - 2).max(0)),
+        Size::new(5, 5),
+    )
+    .into_styled(PrimitiveStyle::with_fill(theme::APPROVE))
+    .draw(t)?;
+
+    if step < 3 {
+        let lbl = match step {
+            0 => "Tap target 1 / 3",
+            1 => "Tap target 2 / 3",
+            _ => "Tap target 3 / 3",
+        };
+        text(
+            t,
+            "Calibrate touch",
+            EgPoint::new(MIDX, 136),
+            Role::Strong,
+            FG,
+        )?;
+        text(
+            t,
+            lbl,
+            EgPoint::new(MIDX, 162),
+            Role::Body,
+            theme::ACCENT_TEXT,
+        )?;
+        text(
+            t,
+            "Wait 10s to cancel",
+            EgPoint::new(MIDX, 188),
+            Role::MonoSmall,
+            theme::CAPTION,
+        )
+    } else {
+        text(
+            t,
+            "Verify calibration",
+            EgPoint::new(MIDX, 76),
+            Role::Strong,
+            FG,
+        )?;
+        text(
+            t,
+            "Tap center target",
+            EgPoint::new(MIDX, 102),
+            Role::Body,
+            theme::ACCENT_TEXT,
+        )?;
+        text(
+            t,
+            "Miss or timeout reverts",
+            EgPoint::new(MIDX, 246),
+            Role::MonoSmall,
+            theme::CAPTION,
+        )
+    }
 }
 
 /// The Security sub-page: the three credential PINs (device and FIDO labelled by whether

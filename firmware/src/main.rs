@@ -49,12 +49,14 @@ mod core1;
 mod display;
 mod flash_storage;
 mod handler;
+mod haptic;
 mod led;
 mod otp_kbd;
 mod otp_keys;
 mod pin_lock;
 mod presence;
 mod rescue_platform;
+mod rtc;
 mod usb_attach;
 mod vendor;
 mod worker;
@@ -194,10 +196,38 @@ const BUILD_LED_POWER_PIN: u8 = env_u16(env!("PK_LED_POWER_PIN")) as u8;
 const BUILD_PRESENCE_IS_GPIO: bool = env_u16(env!("PK_PRESENCE_IS_GPIO")) != 0;
 // The LED block's collision checks read it too, and the ILI9341 display build
 // keeps an LED (its `PRESENCE_PIN` is still rejected, so the value is unused there).
-#[cfg(any(not(feature = "display"), not(led_kind = "none")))]
+#[cfg(any(
+    not(feature = "display"),
+    not(led_kind = "none"),
+    haptic_kind = "pwm",
+    haptic_kind = "drv2605"
+))]
 const BUILD_PRESENCE_PIN: u8 = env_u16(env!("PK_PRESENCE_PIN")) as u8;
 #[cfg(not(feature = "display"))]
 const BUILD_PRESENCE_ACTIVE_HIGH: bool = env_u16(env!("PK_PRESENCE_ACTIVE_HIGH")) != 0;
+
+// Optional haptic feedback (`haptic_kind = "pwm"` or `"drv2605"`).
+#[cfg(haptic_kind = "pwm")]
+const BUILD_HAPTIC_PIN: u8 = env_u16(env!("PK_HAPTIC_PIN")) as u8;
+#[cfg(haptic_kind = "pwm")]
+const BUILD_HAPTIC_PWM_SLICE: u8 = env_u16(env!("PK_HAPTIC_PWM_SLICE")) as u8;
+#[cfg(haptic_kind = "pwm")]
+const BUILD_HAPTIC_PWM_CHANNEL: u8 = env_u16(env!("PK_HAPTIC_PWM_CHANNEL")) as u8;
+#[cfg(any(
+    haptic_kind = "drv2605",
+    not(all(feature = "display", display_panel = "st7789"))
+))]
+const BUILD_HAPTIC_I2C_SDA: u8 = env_u16(env!("PK_HAPTIC_I2C_SDA")) as u8;
+#[cfg(any(
+    haptic_kind = "drv2605",
+    not(all(feature = "display", display_panel = "st7789"))
+))]
+const BUILD_HAPTIC_I2C_SCL: u8 = env_u16(env!("PK_HAPTIC_I2C_SCL")) as u8;
+#[cfg(any(
+    haptic_kind = "drv2605",
+    not(all(feature = "display", display_panel = "st7789"))
+))]
+const BUILD_HAPTIC_I2C_FREQ_HZ: u32 = env_u32(env!("PK_HAPTIC_I2C_FREQ_HZ"));
 
 // Active-high polarity only applies to a GPIO presence button (BOOTSEL has a fixed
 // sense); flag a stray `PRESENCE_ACTIVE_HIGH` set without a GPIO `PRESENCE_PIN`.
@@ -487,6 +517,62 @@ const _: () = {
             );
         }
     }
+
+    // Haptic PWM backend (`HAPTIC_KIND=pwm`): check pin against display control pins,
+    // display bus pins, wake button, and check PWM slice against the backlight PWM slice.
+    #[cfg(haptic_kind = "pwm")]
+    {
+        let mut i = 0;
+        while i < DISPLAY_CTLS.len() {
+            assert!(
+                DISPLAY_CTLS[i] != BUILD_HAPTIC_PIN,
+                "HAPTIC_PIN overlaps a panel/touch control GPIO"
+            );
+            i += 1;
+        }
+        assert!(
+            !contains(HW_PINS, BUILD_HAPTIC_PIN),
+            "HAPTIC_PIN overlaps a display bus pin (SPI0 2/3/4, I2C1 6/7, or the PIO link's clk/data)"
+        );
+        assert!(
+            !BUILD_WAKE_ENABLED || BUILD_HAPTIC_PIN != BUILD_WAKE_PIN,
+            "HAPTIC_PIN overlaps WAKE_PIN"
+        );
+        assert!(
+            BUILD_HAPTIC_PWM_SLICE != BUILD_DISPLAY_BL_PWM_SLICE,
+            "HAPTIC_PWM_SLICE collides with the display backlight PWM slice"
+        );
+    }
+
+    // Haptic DRV2605L backend (`HAPTIC_KIND=drv2605`): check I2C1 SDA/SCL pins against
+    // display control pins, display bus pins, wake button, and the ST7789's CST328 touch
+    // controller (which already owns I2C1).
+    #[cfg(haptic_kind = "drv2605")]
+    {
+        #[cfg(display_panel = "st7789")]
+        panic!(
+            "HAPTIC_KIND=drv2605 uses I2C1, which the ST7789 build's CST328 touch controller already owns"
+        );
+
+        let mut i = 0;
+        while i < DISPLAY_CTLS.len() {
+            assert!(
+                DISPLAY_CTLS[i] != BUILD_HAPTIC_I2C_SDA && DISPLAY_CTLS[i] != BUILD_HAPTIC_I2C_SCL,
+                "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL overlaps a panel/touch control GPIO"
+            );
+            i += 1;
+        }
+        assert!(
+            !contains(HW_PINS, BUILD_HAPTIC_I2C_SDA) && !contains(HW_PINS, BUILD_HAPTIC_I2C_SCL),
+            "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL overlaps a display bus pin (SPI0 2/3/4, or the PIO link's clk/data)"
+        );
+        assert!(
+            !BUILD_WAKE_ENABLED
+                || (BUILD_HAPTIC_I2C_SDA != BUILD_WAKE_PIN
+                    && BUILD_HAPTIC_I2C_SCL != BUILD_WAKE_PIN),
+            "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL overlaps WAKE_PIN"
+        );
+    }
 };
 
 // Backlight PWM: the only valid (pin, slice, channel) combos on the RP2350.
@@ -564,6 +650,86 @@ const BUILD_DRIVER: u8 = 1;
 #[cfg(led_kind = "pimoroni")]
 const BUILD_DRIVER: u8 = 2;
 
+// Haptic PWM & DRV2605L compile-time overlap checks against LED, presence, and USR_LED pins.
+#[cfg(haptic_kind = "pwm")]
+const _: () = {
+    assert!(
+        BUILD_HAPTIC_PWM_SLICE <= 7
+            && BUILD_HAPTIC_PWM_SLICE == (BUILD_HAPTIC_PIN / 2) % 8
+            && BUILD_HAPTIC_PWM_CHANNEL == BUILD_HAPTIC_PIN % 2,
+        "HAPTIC_PIN / HAPTIC_PWM_SLICE / HAPTIC_PWM_CHANNEL mismatch RP2350 PWM routing"
+    );
+    assert!(
+        !(BUILD_PRESENCE_IS_GPIO && BUILD_HAPTIC_PIN == BUILD_PRESENCE_PIN),
+        "HAPTIC_PIN must not equal a GPIO PRESENCE_PIN"
+    );
+    assert!(
+        !(BUILD_USR_LED_ENABLED && BUILD_HAPTIC_PIN == BUILD_USR_LED_PIN),
+        "HAPTIC_PIN must not equal USR_LED_PIN"
+    );
+    #[cfg(not(led_kind = "none"))]
+    {
+        assert!(
+            BUILD_HAPTIC_PIN != BUILD_LED_PIN,
+            "HAPTIC_PIN must not equal LED_PIN"
+        );
+        assert!(
+            !(BUILD_LED_POWER_ENABLED && BUILD_HAPTIC_PIN == BUILD_LED_POWER_PIN),
+            "HAPTIC_PIN must not equal LED_POWER_PIN"
+        );
+        assert!(
+            BUILD_HAPTIC_PIN < 18 || BUILD_HAPTIC_PIN > 20,
+            "HAPTIC_PIN overlaps the pimoroni LED backend's pins 18/19/20"
+        );
+        assert!(
+            BUILD_DRIVER != 2 || !matches!(BUILD_HAPTIC_PWM_SLICE, 1 | 2),
+            "LED_KIND=pimoroni shares PWM slice 1/2 with HAPTIC_PWM_SLICE"
+        );
+    }
+};
+
+#[cfg(haptic_kind = "drv2605")]
+const _: () = {
+    assert!(
+        matches!(
+            (BUILD_HAPTIC_I2C_SDA, BUILD_HAPTIC_I2C_SCL),
+            (2, 3) | (6, 7) | (10, 11) | (14, 15) | (18, 19) | (22, 23) | (26, 27)
+        ),
+        "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL must be a supported RP2350 I2C1 (SDA, SCL) pin pair \
+         ((2, 3), (6, 7), (10, 11), (14, 15), (18, 19), (22, 23), or (26, 27))"
+    );
+    assert!(
+        !(BUILD_PRESENCE_IS_GPIO
+            && (BUILD_HAPTIC_I2C_SDA == BUILD_PRESENCE_PIN
+                || BUILD_HAPTIC_I2C_SCL == BUILD_PRESENCE_PIN)),
+        "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL must not equal a GPIO PRESENCE_PIN"
+    );
+    assert!(
+        !(BUILD_USR_LED_ENABLED
+            && (BUILD_HAPTIC_I2C_SDA == BUILD_USR_LED_PIN
+                || BUILD_HAPTIC_I2C_SCL == BUILD_USR_LED_PIN)),
+        "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL must not equal USR_LED_PIN"
+    );
+    #[cfg(not(led_kind = "none"))]
+    {
+        assert!(
+            BUILD_HAPTIC_I2C_SDA != BUILD_LED_PIN && BUILD_HAPTIC_I2C_SCL != BUILD_LED_PIN,
+            "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL must not equal LED_PIN"
+        );
+        assert!(
+            !(BUILD_LED_POWER_ENABLED
+                && (BUILD_HAPTIC_I2C_SDA == BUILD_LED_POWER_PIN
+                    || BUILD_HAPTIC_I2C_SCL == BUILD_LED_POWER_PIN)),
+            "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL must not equal LED_POWER_PIN"
+        );
+        assert!(
+            (BUILD_HAPTIC_I2C_SDA < 18 || BUILD_HAPTIC_I2C_SDA > 20)
+                && (BUILD_HAPTIC_I2C_SCL < 18 || BUILD_HAPTIC_I2C_SCL > 20),
+            "HAPTIC_I2C_SDA / HAPTIC_I2C_SCL overlaps the pimoroni LED backend's pins 18/19/20"
+        );
+    }
+};
+
 type Drv = UsbDriver<'static, USB>;
 
 static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
@@ -628,6 +794,9 @@ static UI: StaticCell<RefCell<display::Ui>> = StaticCell::new();
 /// SPI0, shared by the ILI9341 panel and the XPT2046 touch inside `UI`.
 #[cfg(all(feature = "display", display_panel = "ili9341", display_bus = "spi0"))]
 static SPI_BUS: StaticCell<display::SharedSpi> = StaticCell::new();
+/// I2C1, shared by the DS3231 RTC and the DRV2605L haptic driver on the same pins.
+#[cfg(not(all(feature = "display", display_panel = "st7789")))]
+static SHARED_I2C1_BUS: StaticCell<rtc::SharedI2c1> = StaticCell::new();
 
 struct SendUsb(UsbDevice<'static, Drv>);
 unsafe impl Send for SendUsb {}
@@ -892,7 +1061,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x09DC;
+    let device_release: u16 = 0x09DD;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -1074,6 +1243,18 @@ async fn main(spawner: Spawner) {
             .filter(|&g| !(BUILD_LED_POWER_ENABLED && g == BUILD_LED_POWER_PIN))
             .filter(|&g| !(BUILD_USR_LED_ENABLED && g == BUILD_USR_LED_PIN))
             .unwrap_or(BUILD_LED_PIN);
+        #[cfg(haptic_kind = "pwm")]
+        let led_gpio = if led_gpio == BUILD_HAPTIC_PIN {
+            BUILD_LED_PIN
+        } else {
+            led_gpio
+        };
+        #[cfg(haptic_kind = "drv2605")]
+        let led_gpio = if led_gpio == BUILD_HAPTIC_I2C_SDA || led_gpio == BUILD_HAPTIC_I2C_SCL {
+            BUILD_LED_PIN
+        } else {
+            led_gpio
+        };
         // The ILI9341 display keeps the LED, so a phy pin must also miss its pads.
         #[cfg(all(feature = "display", display_panel = "ili9341"))]
         let led_gpio = if DISPLAY_CTLS.contains(&led_gpio) || HW_PINS.contains(&led_gpio) {
@@ -1091,6 +1272,12 @@ async fn main(spawner: Spawner) {
         // of them (GP5, slice 2 B) keeps the build driver rather than two owners.
         #[cfg(all(feature = "display", display_panel = "ili9341"))]
         let led_driver = if led_driver == 2 && matches!(BUILD_DISPLAY_BL_PWM_SLICE, 1 | 2) {
+            BUILD_DRIVER
+        } else {
+            led_driver
+        };
+        #[cfg(haptic_kind = "pwm")]
+        let led_driver = if led_driver == 2 && matches!(BUILD_HAPTIC_PWM_SLICE, 1 | 2) {
             BUILD_DRIVER
         } else {
             led_driver
@@ -1214,6 +1401,157 @@ async fn main(spawner: Spawner) {
                 };
                 hp.spawn(led::ws2812_task(ws2812).unwrap());
             }
+        }
+    }
+
+    // Optional haptic feedback backend (`HAPTIC_KIND=pwm` or `drv2605`). Spawned on
+    // `EXECUTOR_HIGH` (`hp`) so touch pulses, PIN prompt cues, and PIN rejection
+    // buzzes play immediately even while the thread executor is inside synchronous
+    // `embassy_time::block_for` polling loops (`collect_pin`, `wait_release_until`).
+    #[cfg(haptic_kind = "pwm")]
+    {
+        use embassy_rp::peripherals::{
+            PIN_0, PIN_1, PIN_2, PIN_3, PIN_4, PIN_5, PIN_6, PIN_7, PIN_8, PIN_9, PIN_10, PIN_11,
+            PIN_12, PIN_13, PIN_14, PIN_15, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, PIN_22,
+            PIN_23, PIN_24, PIN_25, PIN_26, PIN_27, PIN_28, PIN_29, PWM_SLICE0, PWM_SLICE1,
+            PWM_SLICE2, PWM_SLICE3, PWM_SLICE4, PWM_SLICE5, PWM_SLICE6, PWM_SLICE7,
+        };
+        use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+
+        let cfg = PwmConfig::default();
+        // SAFETY: the compile-time asserts and the LED block's runtime `led_gpio` /
+        // `led_driver` filters keep `BUILD_HAPTIC_PIN` and `BUILD_HAPTIC_PWM_SLICE`
+        // disjoint from every panel, touch, wake, presence, USR_LED, and LED owner.
+        let pwm = unsafe {
+            match BUILD_HAPTIC_PIN {
+                0 => Pwm::new_output_a(PWM_SLICE0::steal(), PIN_0::steal(), cfg),
+                1 => Pwm::new_output_b(PWM_SLICE0::steal(), PIN_1::steal(), cfg),
+                2 => Pwm::new_output_a(PWM_SLICE1::steal(), PIN_2::steal(), cfg),
+                3 => Pwm::new_output_b(PWM_SLICE1::steal(), PIN_3::steal(), cfg),
+                4 => Pwm::new_output_a(PWM_SLICE2::steal(), PIN_4::steal(), cfg),
+                5 => Pwm::new_output_b(PWM_SLICE2::steal(), PIN_5::steal(), cfg),
+                6 => Pwm::new_output_a(PWM_SLICE3::steal(), PIN_6::steal(), cfg),
+                7 => Pwm::new_output_b(PWM_SLICE3::steal(), PIN_7::steal(), cfg),
+                8 => Pwm::new_output_a(PWM_SLICE4::steal(), PIN_8::steal(), cfg),
+                9 => Pwm::new_output_b(PWM_SLICE4::steal(), PIN_9::steal(), cfg),
+                10 => Pwm::new_output_a(PWM_SLICE5::steal(), PIN_10::steal(), cfg),
+                11 => Pwm::new_output_b(PWM_SLICE5::steal(), PIN_11::steal(), cfg),
+                12 => Pwm::new_output_a(PWM_SLICE6::steal(), PIN_12::steal(), cfg),
+                13 => Pwm::new_output_b(PWM_SLICE6::steal(), PIN_13::steal(), cfg),
+                14 => Pwm::new_output_a(PWM_SLICE7::steal(), PIN_14::steal(), cfg),
+                15 => Pwm::new_output_b(PWM_SLICE7::steal(), PIN_15::steal(), cfg),
+                16 => Pwm::new_output_a(PWM_SLICE0::steal(), PIN_16::steal(), cfg),
+                17 => Pwm::new_output_b(PWM_SLICE0::steal(), PIN_17::steal(), cfg),
+                18 => Pwm::new_output_a(PWM_SLICE1::steal(), PIN_18::steal(), cfg),
+                19 => Pwm::new_output_b(PWM_SLICE1::steal(), PIN_19::steal(), cfg),
+                20 => Pwm::new_output_a(PWM_SLICE2::steal(), PIN_20::steal(), cfg),
+                21 => Pwm::new_output_b(PWM_SLICE2::steal(), PIN_21::steal(), cfg),
+                22 => Pwm::new_output_a(PWM_SLICE3::steal(), PIN_22::steal(), cfg),
+                23 => Pwm::new_output_b(PWM_SLICE3::steal(), PIN_23::steal(), cfg),
+                24 => Pwm::new_output_a(PWM_SLICE4::steal(), PIN_24::steal(), cfg),
+                25 => Pwm::new_output_b(PWM_SLICE4::steal(), PIN_25::steal(), cfg),
+                26 => Pwm::new_output_a(PWM_SLICE5::steal(), PIN_26::steal(), cfg),
+                27 => Pwm::new_output_b(PWM_SLICE5::steal(), PIN_27::steal(), cfg),
+                28 => Pwm::new_output_a(PWM_SLICE6::steal(), PIN_28::steal(), cfg),
+                _ => Pwm::new_output_b(PWM_SLICE6::steal(), PIN_29::steal(), cfg),
+            }
+        };
+        hp.spawn(haptic::pwm_task(pwm, BUILD_HAPTIC_PWM_CHANNEL).unwrap());
+    }
+
+    // Shared I2C1 bus (default GP14 SDA / GP15 SCL) for the DS3231 RTC and optional
+    // DRV2605L haptic driver on every board except the ST7789 Touch-LCD-2.8 (whose
+    // CST328 touch controller owns I2C1 on GP6/GP7). On non-drv2605 builds we first
+    // verify at runtime that the configured I2C1 SDA/SCL pins do not collide with any
+    // active LED, display, wake, presence, or PWM haptic pin before claiming I2C1.
+    #[cfg(not(all(feature = "display", display_panel = "st7789")))]
+    {
+        use embassy_rp::i2c::{Config as I2cConfig, I2c};
+        use embassy_rp::peripherals::{
+            I2C1, PIN_2, PIN_3, PIN_6, PIN_7, PIN_10, PIN_11, PIN_14, PIN_15, PIN_18, PIN_19,
+            PIN_22, PIN_23, PIN_26, PIN_27,
+        };
+
+        let sda = BUILD_HAPTIC_I2C_SDA;
+        let scl = BUILD_HAPTIC_I2C_SCL;
+        let mut pins_free = matches!(
+            (sda, scl),
+            (2, 3) | (6, 7) | (10, 11) | (14, 15) | (18, 19) | (22, 23) | (26, 27)
+        );
+        #[cfg(not(feature = "display"))]
+        if BUILD_PRESENCE_IS_GPIO && (sda == BUILD_PRESENCE_PIN || scl == BUILD_PRESENCE_PIN) {
+            pins_free = false;
+        }
+        if BUILD_USR_LED_ENABLED && (sda == BUILD_USR_LED_PIN || scl == BUILD_USR_LED_PIN) {
+            pins_free = false;
+        }
+        #[cfg(not(led_kind = "none"))]
+        {
+            if sda == BUILD_LED_PIN || scl == BUILD_LED_PIN {
+                pins_free = false;
+            }
+            if BUILD_LED_POWER_ENABLED && (sda == BUILD_LED_POWER_PIN || scl == BUILD_LED_POWER_PIN)
+            {
+                pins_free = false;
+            }
+            if (18..=20).contains(&sda) || (18..=20).contains(&scl) {
+                pins_free = false;
+            }
+        }
+        #[cfg(haptic_kind = "pwm")]
+        if sda == BUILD_HAPTIC_PIN || scl == BUILD_HAPTIC_PIN {
+            pins_free = false;
+        }
+        #[cfg(feature = "display")]
+        {
+            if DISPLAY_CTLS.contains(&sda)
+                || DISPLAY_CTLS.contains(&scl)
+                || HW_PINS.contains(&sda)
+                || HW_PINS.contains(&scl)
+            {
+                pins_free = false;
+            }
+            if BUILD_WAKE_ENABLED && (sda == BUILD_WAKE_PIN || scl == BUILD_WAKE_PIN) {
+                pins_free = false;
+            }
+        }
+
+        if pins_free {
+            let mut i2c_cfg = I2cConfig::default();
+            i2c_cfg.frequency = BUILD_HAPTIC_I2C_FREQ_HZ;
+            // SAFETY: `pins_free` (and the compile-time asserts on `haptic_kind = "drv2605"`)
+            // guarantee that `I2C1` and `(sda, scl)` are disjoint from every other driver.
+            let i2c = unsafe {
+                match (BUILD_HAPTIC_I2C_SDA, BUILD_HAPTIC_I2C_SCL) {
+                    (2, 3) => {
+                        I2c::new_blocking(I2C1::steal(), PIN_3::steal(), PIN_2::steal(), i2c_cfg)
+                    }
+                    (6, 7) => {
+                        I2c::new_blocking(I2C1::steal(), PIN_7::steal(), PIN_6::steal(), i2c_cfg)
+                    }
+                    (10, 11) => {
+                        I2c::new_blocking(I2C1::steal(), PIN_11::steal(), PIN_10::steal(), i2c_cfg)
+                    }
+                    (14, 15) => {
+                        I2c::new_blocking(I2C1::steal(), PIN_15::steal(), PIN_14::steal(), i2c_cfg)
+                    }
+                    (18, 19) => {
+                        I2c::new_blocking(I2C1::steal(), PIN_19::steal(), PIN_18::steal(), i2c_cfg)
+                    }
+                    (22, 23) => {
+                        I2c::new_blocking(I2C1::steal(), PIN_23::steal(), PIN_22::steal(), i2c_cfg)
+                    }
+                    _ => {
+                        I2c::new_blocking(I2C1::steal(), PIN_27::steal(), PIN_26::steal(), i2c_cfg)
+                    }
+                }
+            };
+            let bus: &'static rtc::SharedI2c1 =
+                SHARED_I2C1_BUS.init(embassy_sync::mutex::Mutex::new(i2c));
+            rtc::init_bus(bus);
+            let _ = rescue_platform::current_unix_secs();
+            #[cfg(haptic_kind = "drv2605")]
+            hp.spawn(haptic::drv2605_task(bus).unwrap());
         }
     }
 

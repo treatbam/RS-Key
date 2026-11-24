@@ -2568,3 +2568,71 @@ fn an_otp_pin_is_required_before_the_password_safe_is_served() {
         Sw::SECURITY_STATUS_NOT_SATISFIED
     );
 }
+
+#[test]
+fn compute_totp_at_matches_rfc6238_and_skips_hotp() {
+    let mut fs = new_fs();
+    let rng = RefCell::new(CountRng(7));
+    let touch = RefCell::new(AlwaysConfirm);
+    let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+    // idx 0: TOTP SHA-1, 8 digits, period 30s
+    assert_eq!(
+        put(
+            &mut app,
+            &mut fs,
+            &put_data(b"sha1", 0x20 | ALG_HMAC_SHA1, 8, SECRET_SHA1, false, None)
+        ),
+        Sw::OK
+    );
+    // idx 1: TOTP SHA-256, 8 digits, period 60s prefix
+    assert_eq!(
+        put(
+            &mut app,
+            &mut fs,
+            &put_data(
+                b"60/sha256",
+                0x20 | ALG_HMAC_SHA256,
+                8,
+                SECRET_SHA256,
+                true,
+                None
+            )
+        ),
+        Sw::OK
+    );
+    // idx 2: HOTP SHA-1, 6 digits
+    assert_eq!(
+        put(
+            &mut app,
+            &mut fs,
+            &put_data(b"hotp", 0x10 | ALG_HMAC_SHA1, 6, SECRET_SHA1, false, None)
+        ),
+        Sw::OK
+    );
+    let dev = Device {
+        serial_hash: &[0x22; 32],
+        serial_id: &SERIAL,
+        otp_key: None,
+    };
+    // unix_secs = 59 -> T = 59 / 30 = 1 -> RFC 6238 SHA-1 vector 94287082, remaining = 1s
+    assert_eq!(
+        compute_totp_at(&dev, &mut fs, 0, 59),
+        Some(OathLiveCode {
+            code: 94287082,
+            digits: 8,
+            remaining_secs: 1,
+        })
+    );
+    // unix_secs = 75 -> period 60s -> T = 75 / 60 = 1 -> RFC 6238 SHA-256 vector 46119246, remaining = 45s
+    assert_eq!(
+        compute_totp_at(&dev, &mut fs, 1, 75),
+        Some(OathLiveCode {
+            code: 46119246,
+            digits: 8,
+            remaining_secs: 45,
+        })
+    );
+    // HOTP is counter-based and must never be advanced or computed by the read-only TOTP helper.
+    assert_eq!(compute_totp_at(&dev, &mut fs, 2, 59), None);
+    assert_eq!(compute_totp_at(&dev, &mut fs, 99, 59), None);
+}

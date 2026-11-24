@@ -316,6 +316,7 @@ where
         self.hooks.set_led_status(rsk_led::STATUS_TOUCH);
         self.hooks.set_cancel_requested(false);
         self.hooks.set_up_pending(true);
+        self.hooks.set_pin_pad_open(true);
 
         let start = Instant::now();
         let timeout = Duration::from_millis(self.hooks.presence_timeout_ms() as u64);
@@ -350,6 +351,22 @@ where
             ),
         );
         self.shown = None; // force the status loop to repaint once we release it
+        // Trigger the haptic cue right when the PIN pad is shown:
+        // - If this re-prompt was caused by a rejected PIN (`WrongPin`, `Mismatch`,
+        //   or `TooWeak`), fire the long rejection buzz at the exact instant the UI
+        //   renders the error caption (after the constant-time check has completed).
+        // - Otherwise fire the soft double-pulse PIN prompt cue.
+        match caption {
+            Some(PinCaption::WrongPin { .. } | PinCaption::Mismatch | PinCaption::TooWeak) => {
+                self.hooks.haptic_pin_error();
+            }
+            None
+            | Some(
+                PinCaption::TriesRemaining { .. } | PinCaption::ChoosePin | PinCaption::Reenter,
+            ) => {
+                self.hooks.haptic_pin_prompt();
+            }
+        }
         // The CST328 reports a level, not an edge, so a finger still down from whatever
         // preceded this pad reads as a keypress on the very first poll — and the Allow
         // button overlaps the bottom key row, so it types a stray `0` and burns a PIN
@@ -454,6 +471,7 @@ where
             block_for(Duration::from_millis(TOUCH_POLL_MS));
         };
 
+        self.hooks.set_pin_pad_open(false);
         self.hooks.set_up_pending(false);
         self.hooks.set_cancel_requested(false);
         AMBIENT_QUIET_UNTIL_MS.store(
@@ -472,6 +490,7 @@ where
     /// clientPIN's `EF_PIN`); a host `authenticatorReset` clears both.
     pub(super) fn show_pin_blocked(&mut self) {
         let _ = rsk_ui::render_pin_blocked(&mut self.frame());
+        self.hooks.haptic_pin_error();
         self.hold_notice();
     }
 

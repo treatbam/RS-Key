@@ -227,6 +227,8 @@ fn display_rows_map_in_order() {
         DisplayEntry::Brightness,
         DisplayEntry::Sleep,
         DisplayEntry::Timeout,
+        DisplayEntry::Haptics,
+        DisplayEntry::CalibrateTouch,
     ];
     assert_eq!(want.len() as u16, DISPLAY_ROWS);
     for (i, &e) in want.iter().enumerate() {
@@ -241,6 +243,30 @@ fn display_rows_map_in_order() {
         hit_display(Point::new(r0.x + r0.w / 2, r0.y + r0.h + 1)),
         None
     );
+}
+
+#[test]
+fn haptics_rows_map_in_order_and_level_cycles() {
+    let want = [
+        HapticsEntry::Level,
+        HapticsEntry::PinClicks,
+        HapticsEntry::TestCues,
+    ];
+    assert_eq!(want.len() as u16, HAPTICS_ROWS);
+    for (i, &e) in want.iter().enumerate() {
+        let r = settings_row_rect(i as u16);
+        let c = Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        assert_eq!(hit_haptics(c), Some(e));
+        assert_eq!(haptics_row_entry(i as u16), e);
+    }
+    assert_eq!(cycle_haptic_level(HAPTIC_LEVEL_OFF), HAPTIC_LEVEL_LOW);
+    assert_eq!(cycle_haptic_level(HAPTIC_LEVEL_LOW), HAPTIC_LEVEL_MEDIUM);
+    assert_eq!(cycle_haptic_level(HAPTIC_LEVEL_MEDIUM), HAPTIC_LEVEL_HIGH);
+    assert_eq!(cycle_haptic_level(HAPTIC_LEVEL_HIGH), HAPTIC_LEVEL_OFF);
+    assert_eq!(haptic_level_label(HAPTIC_LEVEL_OFF), "Off");
+    assert_eq!(haptic_level_label(HAPTIC_LEVEL_LOW), "Low");
+    assert_eq!(haptic_level_label(HAPTIC_LEVEL_MEDIUM), "Medium");
+    assert_eq!(haptic_level_label(HAPTIC_LEVEL_HIGH), "High");
 }
 
 #[test]

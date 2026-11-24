@@ -1714,6 +1714,80 @@ pub fn for_each_cred<S: Storage>(
     count
 }
 
+/// Live TOTP code and countdown computed for the trusted display when an RTC is set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OathLiveCode {
+    /// Truncated numeric TOTP code (`0..10^digits`).
+    pub code: u32,
+    /// Configured decimal width (`6..=8`).
+    pub digits: u8,
+    /// Seconds remaining in the current TOTP window (`1..=period`).
+    pub remaining_secs: u8,
+}
+
+/// Compute the `idx`-th present OATH credential's live TOTP code at `unix_secs` for the
+/// trusted display (read-only: never mutates HOTP counters or `TAG_LAST_CHAL`, and
+/// zeroizes its stack buffers before returning). Returns `None` if `idx` is out of range
+/// or the credential is HOTP (counter-based).
+pub fn compute_totp_at<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    idx: usize,
+    unix_secs: u64,
+) -> Option<OathLiveCode> {
+    let mut fids = [0u16; MAX_OATH_CRED as usize];
+    let nfids = present_creds(fs, &mut fids);
+    let mut scratch = [0u8; CRED_MAX];
+    let mut mac = [0u8; 64];
+    let mut seen = 0usize;
+    let mut result = None;
+    for &fid in &fids[..nfids] {
+        let Some(n) = seal::seal_read(dev, fs, KeyFid::new(fid), &mut scratch) else {
+            continue;
+        };
+        let blob = &scratch[..n.min(CRED_MAX)];
+        let (Some(name), Some(key)) = (
+            find_tag(blob, TAG_NAME as u16),
+            find_tag(blob, TAG_KEY as u16),
+        ) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        };
+        if seen == idx {
+            let hotp = key[0] & OATH_TYPE_MASK == OATH_TYPE_HOTP;
+            if !hotp && key.len() >= 2 {
+                let (period_prefix, _) = split_period(name);
+                let period = period_prefix.unwrap_or(30).max(1) as u64;
+                let counter = (unix_secs / period).to_be_bytes();
+                let remaining_secs = (period - (unix_secs % period)).min(u8::MAX as u64) as u8;
+                let digits = key[1];
+                if let Some(size) = oath_hmac(key[0], &key[2..], &counter, &mut mac) {
+                    let off = (mac[size - 1] & 0xF) as usize;
+                    let trunc = u32::from_be_bytes([
+                        mac[off] & 0x7F,
+                        mac[off + 1],
+                        mac[off + 2],
+                        mac[off + 3],
+                    ]);
+                    let code = code_modulus(digits).map_or(trunc, |m| trunc % m);
+                    result = Some(OathLiveCode {
+                        code,
+                        digits,
+                        remaining_secs,
+                    });
+                }
+            }
+            break;
+        }
+        seen += 1;
+    }
+    scratch.zeroize();
+    mac.zeroize();
+    result
+}
+
 /// Find a present credential whose `TAG_NAME` equals `name`; the blob is left in
 /// `buf`. Only present slots are read (see [`present_creds`]).
 fn find_cred<S: Storage>(

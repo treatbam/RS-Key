@@ -56,8 +56,8 @@ use rsk_fs::Fs;
 use rsk_sdk::Confirm;
 use rsk_ui::{
     ALLOW_RECT, AccountRow, AdjustKey, AppEntry, AuditRow, BRIGHTNESS_LEVELS, BackupView, Button,
-    ConfirmPrompt, DisplayEntry, HomeView, Label, NavTab, PinCaption, PinKey, PinPad, RootEntry,
-    RpRow, Screen, SecurityEntry, SettingsPage, SettingsView, StatusKind, SuccessKind,
+    ConfirmPrompt, DisplayEntry, HapticsEntry, HomeView, Label, NavTab, PinCaption, PinKey, PinPad,
+    RootEntry, RpRow, Screen, SecurityEntry, SettingsPage, SettingsView, StatusKind, SuccessKind,
 };
 
 mod applets;
@@ -75,7 +75,7 @@ pub use presence::TouchPresence;
 pub use status::status_loop;
 pub use touch::TouchPad;
 
-use settings::EF_DISPLAY;
+use settings::{EF_DISPLAY, EF_TOUCH_CAL};
 
 /// The board verbs this flow cannot perform itself, plus the firmware globals a
 /// ceremony coordinates through. Every method defaults to an exact no-op for a
@@ -120,6 +120,30 @@ pub trait Hooks {
     /// current-PIN prompt is `changePIN`'s old-PIN check, and over USB that check
     /// drops the token on a mismatch.
     fn note_local_pin_failed(&mut self) {}
+    /// Optional non-blocking haptic click when a touch is registered or a knob cycles.
+    fn haptic_touch(&mut self) {}
+    /// Optional non-blocking haptic cue when the user is prompted to enter a PIN.
+    fn haptic_pin_prompt(&mut self) {}
+    /// Optional non-blocking haptic buzz when a PIN is rejected or blocked.
+    fn haptic_pin_error(&mut self) {}
+    /// Optional non-blocking haptic test sequence (touch click -> PIN prompt -> rejection buzz).
+    fn haptic_test_cues(&mut self) {}
+    /// Active haptic intensity level (`0` = Off, `1` = Low, `2` = Medium, `3` = High).
+    fn haptic_level(&self) -> u8 {
+        rsk_ui::HAPTIC_LEVEL_DEFAULT
+    }
+    fn set_haptic_level(&mut self, _level: u8) {}
+    /// Whether touch-click haptics are muted while the on-screen PIN pad is open.
+    fn mute_pin_haptic(&self) -> bool {
+        false
+    }
+    fn set_mute_pin_haptic(&mut self, _mute: bool) {}
+    /// Notify the haptic backend whether the on-screen PIN pad is currently open.
+    fn set_pin_pad_open(&mut self, _open: bool) {}
+    /// Read the current Unix timestamp in seconds from an external RTC (e.g. DS3231), if present and valid.
+    fn rtc_unix_secs(&mut self) -> Option<u64> {
+        None
+    }
     /// Whether the boot ROM actually verifies the image signature (read from OTP),
     /// shown read-only on Settings → Firmware.
     fn secure_boot_enabled(&self) -> bool {
@@ -457,7 +481,7 @@ where
     /// window, and it is done by the time the flow is handed them.
     pub fn new(
         mut panel: P,
-        touch: T,
+        mut touch: T,
         mut hooks: H,
         info: DeviceInfo,
         fs: &'a RefCell<Fs<S>>,
@@ -466,18 +490,27 @@ where
     ) -> Self {
         let _ = rsk_ui::render(&mut rsk_ui::scene::Frame::new(&mut panel), &Screen::Splash);
 
-        // Restore the persisted display settings before lighting the panel, so it
-        // comes up at the saved brightness (no full-bright flash then dim) and the
-        // saved sleep timeout. Absent (fresh device) keeps the live defaults.
+        // Restore the persisted display + haptic settings and any calibrated resistive
+        // touch matrix before lighting the panel, so it comes up at the saved brightness
+        // (no full-bright flash then dim) and the saved sleep timeout.
         let mut dcfg = rsk_ui::DisplayConfig::default();
         {
+            let mut fs_ref = fs.borrow_mut();
             let mut buf = [0u8; rsk_ui::DISPLAY_CONF_LEN];
-            if let Some(n) = fs.borrow_mut().read(EF_DISPLAY, &mut buf) {
+            if let Some(n) = fs_ref.read(EF_DISPLAY, &mut buf) {
                 dcfg.apply_block(&buf[..n.min(buf.len())]);
+            }
+            let mut cal_buf = [0u8; rsk_ui::TOUCH_CAL_LEN];
+            if let Some(n) = fs_ref.read(EF_TOUCH_CAL, &mut cal_buf)
+                && let Some(cal) = rsk_ui::decode_touch_cal(&cal_buf[..n.min(cal_buf.len())])
+            {
+                touch.set_calibration(cal);
             }
         }
         SLEEP_TIMEOUT_MS.store(dcfg.sleep_secs as u32 * 1000, Ordering::Relaxed);
         let brightness = dcfg.brightness.clamp(1, BRIGHTNESS_LEVELS);
+        hooks.set_haptic_level(dcfg.haptic_level);
+        hooks.set_mute_pin_haptic(dcfg.mute_pin_haptic);
 
         // Backlight up to the saved level only now there is something to show (the
         // caller brings the panel up dark, so there is no white flash through init).

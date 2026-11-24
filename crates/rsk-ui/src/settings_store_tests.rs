@@ -15,6 +15,9 @@ fn default_mirrors_firmware_runtime_defaults() {
     assert_eq!(d.brightness, crate::BRIGHTNESS_LEVELS);
     assert_eq!(d.sleep_secs, 60);
     assert!(!d.pin_declined);
+    assert!(!d.scramble_pin);
+    assert_eq!(d.haptic_level, crate::HAPTIC_LEVEL_DEFAULT);
+    assert!(!d.mute_pin_haptic);
 }
 
 #[test]
@@ -24,6 +27,8 @@ fn encode_decode_roundtrip() {
         sleep_secs: 120,
         pin_declined: true,
         scramble_pin: false,
+        haptic_level: crate::HAPTIC_LEVEL_HIGH,
+        mute_pin_haptic: true,
     };
     let mut got = DisplayConfig::default();
     got.apply_block(&cfg.encode());
@@ -37,6 +42,7 @@ fn encode_layout_is_brightness_then_be_sleep_then_flags() {
         sleep_secs: 300,
         pin_declined: true,
         scramble_pin: false,
+        ..DisplayConfig::default()
     }
     .encode();
     assert_eq!(b.len(), 4);
@@ -52,6 +58,7 @@ fn pin_declined_clear_encodes_zero_flags() {
         sleep_secs: 60,
         pin_declined: false,
         scramble_pin: false,
+        ..DisplayConfig::default()
     }
     .encode();
     assert_eq!(b[3], 0);
@@ -64,6 +71,7 @@ fn off_sentinel_roundtrips() {
         sleep_secs: 0, // Off
         pin_declined: false,
         scramble_pin: false,
+        ..DisplayConfig::default()
     };
     let mut got = DisplayConfig::default();
     got.apply_block(&cfg.encode());
@@ -81,6 +89,8 @@ fn legacy_core_block_loads_fields_and_keeps_flag_default() {
     assert_eq!(got.brightness, 3);
     assert_eq!(got.sleep_secs, 30);
     assert!(!got.pin_declined);
+    assert_eq!(got.haptic_level, crate::HAPTIC_LEVEL_DEFAULT);
+    assert!(!got.mute_pin_haptic);
 }
 
 #[test]
@@ -118,6 +128,7 @@ fn longer_future_block_reads_known_prefix() {
         sleep_secs: 30,
         pin_declined: true,
         scramble_pin: false,
+        ..DisplayConfig::default()
     };
     let mut b = [0u8; 7];
     b[..CONF_LEN].copy_from_slice(&cfg.encode());
@@ -208,6 +219,7 @@ fn the_scramble_flag_is_independent_of_the_onboarding_flag() {
             sleep_secs: 45,
             pin_declined: declined,
             scramble_pin: scramble,
+            ..DisplayConfig::default()
         };
         let mut back = DisplayConfig::default();
         back.apply_block(&cfg.encode());
@@ -239,10 +251,58 @@ fn an_older_firmware_still_reads_a_record_carrying_the_new_bit() {
         sleep_secs: 30,
         pin_declined: true,
         scramble_pin: true,
+        ..DisplayConfig::default()
     }
     .encode();
     assert_eq!(block.len(), CONF_LEN, "the record must not have grown");
     assert_eq!(block[0], 2);
     assert_eq!(u16::from_be_bytes([block[1], block[2]]), 30);
     assert_eq!(block[3] & FLAG_PIN_DECLINED, FLAG_PIN_DECLINED);
+}
+
+#[test]
+fn haptic_level_and_pin_mute_roundtrip_all_combinations() {
+    for level in 0..=crate::HAPTIC_LEVEL_HIGH {
+        for mute in [false, true] {
+            for declined in [false, true] {
+                for scramble in [false, true] {
+                    let cfg = DisplayConfig {
+                        brightness: 3,
+                        sleep_secs: 60,
+                        pin_declined: declined,
+                        scramble_pin: scramble,
+                        haptic_level: level,
+                        mute_pin_haptic: mute,
+                    };
+                    let mut back = DisplayConfig::default();
+                    back.apply_block(&cfg.encode());
+                    assert_eq!(back, cfg);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn touch_cal_encode_decode_roundtrips_and_rejects_degenerate() {
+    let cal = crate::touch::Xpt2046Cal {
+        x_min: 280,
+        x_max: 3780,
+        y_min: 3920,
+        y_max: 240,
+        swap_xy: true,
+    };
+    let enc = encode_touch_cal(&cal);
+    assert_eq!(decode_touch_cal(&enc), Some(cal));
+
+    // Truncated, all-zero, all-0xFF, and small-span blocks are rejected.
+    assert_eq!(decode_touch_cal(&enc[..TOUCH_CAL_LEN - 1]), None);
+    assert_eq!(decode_touch_cal(&[0u8; TOUCH_CAL_LEN]), None);
+    assert_eq!(decode_touch_cal(&[0xFF; TOUCH_CAL_LEN]), None);
+    let tiny = crate::touch::Xpt2046Cal {
+        x_min: 1000,
+        x_max: 1100,
+        ..cal
+    };
+    assert_eq!(decode_touch_cal(&encode_touch_cal(&tiny)), None);
 }

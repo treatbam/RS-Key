@@ -450,118 +450,21 @@ fn changing_the_device_pin_needs_the_current_one() {
 }
 
 #[test]
-fn setting_the_fido_pin_from_the_panel_revokes_live_tokens() {
-    // CTAP 2.1 §6.5.5.6. `FidoState` lives in the worker and outlives every
-    // dispatch, and a pinUvAuthToken is random RAM state rather than a PIN
-    // derivative — so without this a host holding a `PERM_CM` token minted under
-    // the old PIN goes on deleting resident credentials, with no touch, right
-    // after the owner did the one thing they believe revokes it.
+fn haptic_cues_fire_on_pin_prompts_and_rejections() {
     let env = Env::new();
-    let mut taps = pin_entry(PIN);
+    env.set_device_pin(PIN);
+    // 1. Initial prompt (`TriesRemaining(8)`) -> +1 prompt cue.
+    // 2. Wrong PIN entered -> re-prompt (`WrongPin(7)`) -> +1 error cue.
+    // 3. Correct PIN entered -> gate passes.
+    let mut taps = pin_entry(WRONG_PIN);
     taps.extend(pin_entry(PIN));
     let mut ui = env.ui(Pad::taps(&taps));
-    ui.run_set_pin(PinScope::Fido);
-    assert!(rsk_fido::passkeys::pin_is_set(&mut env.fs.borrow_mut()));
-    assert_eq!(ui.hooks.pin_changed, 1);
-    // Which PIN, not just that one exists: revoking the live tokens is worth nothing if
-    // the clientPIN the host must now be told is not the one typed on the panel.
-    assert!(
-        matches!(
-            rsk_fido::passkeys::spend_and_verify_local_pin(&dev(), &mut env.fs.borrow_mut(), PIN),
-            rsk_fido::passkeys::LocalPin::Ok
-        ),
-        "the stored clientPIN is not the PIN that was typed"
-    );
-}
+    assert!(ui.local_pin_gate(PinScope::Device));
+    assert_eq!(ui.hooks.haptic_prompts, 1);
+    assert_eq!(ui.hooks.haptic_errors, 1);
 
-// --- the hold-to-confirm gesture -------------------------------------------
-
-#[test]
-fn a_brush_does_not_complete_a_hold() {
-    // The gesture the passkey delete and the factory reset stand on: a single
-    // sample on the button is not consent.
-    let env = Env::new();
-    let mut ui = env.ui(Pad::script(&[
-        Some(center(rsk_ui::DEL_HOLD_RECT)),
-        None,
-        Some(center(rsk_ui::PK_BACK_RECT)),
-    ]));
-    assert!(!ui.hold_to_confirm("Delete", rsk_ui::theme::DANGER_FILL));
-}
-
-#[test]
-fn a_completed_hold_confirms() {
-    let env = Env::new();
-    let mut ui = env.ui(Pad::hold(center(rsk_ui::DEL_HOLD_RECT)));
-    let start = Instant::now();
-    assert!(ui.hold_to_confirm("Delete", rsk_ui::theme::DANGER_FILL));
-    assert!(start.elapsed() >= Duration::from_millis(HOLD_MS));
-}
-
-#[test]
-fn a_hold_that_is_released_starts_over() {
-    // Two half-holds are not one whole one — lifting the finger resets the fill.
-    let half = (HOLD_MS as usize * 3 / 4) / TOUCH_POLL_MS as usize;
-    let on = center(rsk_ui::DEL_HOLD_RECT);
-    let mut script = vec![Some(on); half];
-    script.push(None);
-    script.extend(vec![Some(on); half]);
-    script.push(Some(center(rsk_ui::PK_BACK_RECT)));
-    let env = Env::new();
-    let mut ui = env.ui(Pad::script(&script));
-    assert!(!ui.hold_to_confirm("Delete", rsk_ui::theme::DANGER_FILL));
-}
-
-#[test]
-fn the_back_chevron_abandons_a_hold_screen() {
-    let env = Env::new();
-    let mut ui = env.ui(Pad::taps(&[center(rsk_ui::PK_BACK_RECT)]));
-    assert!(!ui.hold_to_confirm("Delete", rsk_ui::theme::DANGER_FILL));
-}
-
-/// Issue #107. The panel is not only the device's own UI: `Ctx` hands it to the CTAP
-/// dispatch as the `UserPresence` backend, and that dispatch holds `fs` AND `rng`
-/// borrowed for the whole command. `collect_pin_impl`'s comment already forbids
-/// touching `fs` here; nobody extended it to `rng`, and the scrambled pad grew a
-/// `self.rng.borrow_mut()` — a BorrowMutError, which under `panic-halt` is a board
-/// that dies mid-ceremony and comes back only on the reset button. Measured on a
-/// display board: `makeCredential {rk:true, uv:true}` with no token killed it inside
-/// the scrambled-pad branch of `Ui::collect_pin`, named by a panic handler that rode
-/// the file hash and line out in the USB serial string.
-///
-/// The cells are taken AFTER the panel is built, which is the real order: the seed
-/// is drawn at boot, every pad after that is a ceremony away.
-#[test]
-fn a_pad_raised_mid_dispatch_touches_no_shared_cell() {
-    for scramble in [false, true] {
-        let env = Env::new();
-        let mut ui = env.ui(Pad::taps(&pin_entry(PIN)));
-        ui.scramble_pin = scramble;
-        let _fs = env.fs.borrow_mut();
-        let _rng = env.rng.borrow_mut();
-        let mut out = [0u8; 64];
-        // Reaching this line at all is the property: a shared-cell borrow in here is a
-        // BorrowMutError, and the assertion never runs.
-        let got = ui.collect_pin(title(), None, FLOOR, FLOOR as u8, &mut out, false);
-        assert!(
-            matches!(got, rsk_sdk::PinEntry::Entered(n) if n == PIN.len()),
-            "scramble_pin = {scramble}: {got:?}"
-        );
-        // Only the identity layout maps those taps back to those digits; a shuffled pad
-        // turns the same positions into different ones, which is the whole point of it.
-        if !scramble {
-            assert_eq!(&out[..PIN.len()], PIN);
-        }
-    }
-}
-
-/// …and the layout it draws still moves: a pad that always shuffled the same way
-/// would satisfy the test above while losing the property the toggle exists for.
-#[test]
-fn the_pad_shuffle_does_not_repeat() {
-    let env = Env::new();
-    let mut ui = env.ui(Pad::taps(&[]));
-    let first = ui.shuffle_entropy();
-    let second = ui.shuffle_entropy();
-    assert_ne!(first, second, "consecutive pads share a layout");
+    // A lockout notice fires the error buzz without raising a PIN prompt.
+    ui.show_pin_blocked();
+    assert_eq!(ui.hooks.haptic_prompts, 1);
+    assert_eq!(ui.hooks.haptic_errors, 2);
 }

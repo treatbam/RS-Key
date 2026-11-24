@@ -58,3 +58,16 @@ touch_x_max = 300
 touch_y_min = 3800
 touch_y_max = 300
 touch_swap_xy = false
+
+[haptic]
+# Optional haptic motor (`none`, `pwm`, or `drv2605`); override with `HAPTIC_KIND=<kind>`.
+kind = "none"
+# `kind = "pwm"`: ERM coin motor via external NPN/MOSFET + flyback diode on GPIO26 (PWM5A).
+pin = 26
+pwm_slice = 5
+pwm_channel = "A"
+# `kind = "drv2605"`: TI DRV2605L on I2C1 (GPIO14 SDA / GPIO15 SCL, shared with a future RTC).
+i2c_sda = 14
+i2c_scl = 15
+i2c_freq_hz = 400_000
+actuator = "erm"

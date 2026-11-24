@@ -8,10 +8,14 @@
 //! The block is `[brightness, sleep_secs_be(2), flags]` (4 bytes): the backlight
 //! level (`1..=BRIGHTNESS_LEVELS`), the display-sleep timeout in seconds (`0` =
 //! Off), and a flags byte ([`FLAG_PIN_DECLINED`] — the user chose "continue without a device
-//! PIN" at first-run, so the panel must not re-prompt — and [`FLAG_SCRAMBLE_PIN`]).
+//! PIN" at first-run, so the panel must not re-prompt — [`FLAG_SCRAMBLE_PIN`],
+//! [`FLAG_MUTE_PIN_HAPTIC`], and the 2-bit haptic intensity level XORed with
+//! [`crate::HAPTIC_LEVEL_DEFAULT`] so a legacy zero-bits record loads at the default
+//! Medium intensity).
 //! The **touch timeout** is *not* here — it persists in the phy record's
 //! `PresenceTimeout` tag (shared with `rsk hw --touch-timeout`), so it keeps one
-//! source of truth.
+//! source of truth. Resistive touch calibration persists in its own `EF_TOUCH_CAL`
+//! record ([`encode_touch_cal`] / [`decode_touch_cal`]).
 //!
 //! [`DisplayConfig::apply_block`] overlays a stored block onto a default `self`,
 //! field by field, so a record written by an *older* firmware (the original
@@ -34,25 +38,36 @@ pub const CONF_LEN: usize = 4;
 /// device keeps its brightness / sleep across the upgrade that added the byte.
 const CORE_LEN: usize = 3;
 
-/// Flags-byte bit 1: scramble the PIN pad's digits on every entry. Off by default —
-/// it trades muscle memory for smudge/over-the-shoulder resistance, and the retry
-/// budget makes a typo expensive (`PIN_MISMATCH_LIMIT` is three per power cycle), so
-/// it is the owner's call rather than the firmware's.
-pub const FLAG_SCRAMBLE_PIN: u8 = 0x02;
-
 /// Flags-byte bit 0: the user chose "continue without a device PIN" at the
 /// first-run prompt. Set, the panel never re-shows that onboarding screen (until a
 /// factory reset wipes `EF_DISPLAY`); clear (the default), a PIN-less device is
 /// offered the prompt once.
 pub const FLAG_PIN_DECLINED: u8 = 0x01;
 
+/// Flags-byte bit 1: scramble the PIN pad's digits on every entry. Off by default —
+/// it trades muscle memory for smudge/over-the-shoulder resistance, and the retry
+/// budget makes a typo expensive (`PIN_MISMATCH_LIMIT` is three per power cycle), so
+/// it is the owner's call rather than the firmware's.
+pub const FLAG_SCRAMBLE_PIN: u8 = 0x02;
+
+/// Flags-byte bit 2: mute haptic touch clicks while the on-screen PIN pad is open
+/// (Settings → Display → Haptics → "PIN pad clicks"). Off (clicks enabled) by default.
+pub const FLAG_MUTE_PIN_HAPTIC: u8 = 0x04;
+
+/// Flags-byte bits 3..=4: haptic intensity level (`0..=3`), stored XORed with
+/// [`crate::HAPTIC_LEVEL_DEFAULT`] (`2`) so `0b00` in an older record decodes to
+/// [`crate::HAPTIC_LEVEL_DEFAULT`].
+pub const FLAG_HAPTIC_LEVEL_SHIFT: u8 = 3;
+/// Mask for the 2-bit haptic level field after shifting by [`FLAG_HAPTIC_LEVEL_SHIFT`].
+pub const FLAG_HAPTIC_LEVEL_MASK: u8 = 0x03;
+
 /// Default display-sleep timeout in seconds — the single source of truth: the
 /// firmware derives its `DEFAULT_SLEEP_MS` from it, so a device with no record
 /// blanks on the same schedule it did before this record existed.
 pub const DEFAULT_SLEEP_SECS: u16 = 60;
 
-/// The persisted display settings: backlight level, the display-sleep timeout, and
-/// the first-run PIN-prompt flag.
+/// The persisted display settings: backlight level, the display-sleep timeout,
+/// first-run PIN-prompt flag, PIN-pad scramble flag, and haptic preferences.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DisplayConfig {
     /// Backlight level `1..=BRIGHTNESS_LEVELS`. Stored raw; the firmware clamps it
@@ -68,6 +83,10 @@ pub struct DisplayConfig {
     /// Draw the PIN pad's digits in a fresh random order for every entry (Settings →
     /// Security → "Scramble PIN pad"). Off by default.
     pub scramble_pin: bool,
+    /// Haptic intensity level (`0` = Off, `1` = Low, `2` = Medium default, `3` = High).
+    pub haptic_level: u8,
+    /// Suppress haptic touch clicks while the on-screen PIN pad is open.
+    pub mute_pin_haptic: bool,
 }
 
 impl Default for DisplayConfig {
@@ -77,6 +96,8 @@ impl Default for DisplayConfig {
             sleep_secs: DEFAULT_SLEEP_SECS,
             pin_declined: false,
             scramble_pin: false,
+            haptic_level: crate::HAPTIC_LEVEL_DEFAULT,
+            mute_pin_haptic: false,
         }
     }
 }
@@ -93,6 +114,11 @@ impl DisplayConfig {
         if self.scramble_pin {
             flags |= FLAG_SCRAMBLE_PIN;
         }
+        if self.mute_pin_haptic {
+            flags |= FLAG_MUTE_PIN_HAPTIC;
+        }
+        let level_bits = (self.haptic_level & FLAG_HAPTIC_LEVEL_MASK) ^ crate::HAPTIC_LEVEL_DEFAULT;
+        flags |= (level_bits & FLAG_HAPTIC_LEVEL_MASK) << FLAG_HAPTIC_LEVEL_SHIFT;
         [self.brightness, s[0], s[1], flags]
     }
 
@@ -111,8 +137,59 @@ impl DisplayConfig {
         if b.len() >= CONF_LEN {
             self.pin_declined = b[3] & FLAG_PIN_DECLINED != 0;
             self.scramble_pin = b[3] & FLAG_SCRAMBLE_PIN != 0;
+            self.mute_pin_haptic = b[3] & FLAG_MUTE_PIN_HAPTIC != 0;
+            let raw_level = (b[3] >> FLAG_HAPTIC_LEVEL_SHIFT) & FLAG_HAPTIC_LEVEL_MASK;
+            self.haptic_level = raw_level ^ crate::HAPTIC_LEVEL_DEFAULT;
         }
     }
+}
+
+/// `EF_TOUCH_CAL` wire length: `[flags, x_min_be(2), x_max_be(2), y_min_be(2), y_max_be(2)]`.
+pub const TOUCH_CAL_LEN: usize = 9;
+
+/// `EF_TOUCH_CAL` flag bit 0: swap raw X/Y axes before mapping to panel coordinates.
+pub const TOUCH_CAL_FLAG_SWAP_XY: u8 = 0x01;
+
+/// Encode an [`Xpt2046Cal`](crate::touch::Xpt2046Cal) into its 9-byte flash record.
+pub fn encode_touch_cal(cal: &crate::touch::Xpt2046Cal) -> [u8; TOUCH_CAL_LEN] {
+    let x0 = cal.x_min.to_be_bytes();
+    let x1 = cal.x_max.to_be_bytes();
+    let y0 = cal.y_min.to_be_bytes();
+    let y1 = cal.y_max.to_be_bytes();
+    let flags = if cal.swap_xy {
+        TOUCH_CAL_FLAG_SWAP_XY
+    } else {
+        0
+    };
+    [
+        flags, x0[0], x0[1], x1[0], x1[1], y0[0], y0[1], y1[0], y1[1],
+    ]
+}
+
+/// Decode a stored `EF_TOUCH_CAL` record, rejecting truncated, zero-span, or out-of-12-bit-ADC
+/// records so flash corruption can never install a degenerate touch mapping.
+pub fn decode_touch_cal(b: &[u8]) -> Option<crate::touch::Xpt2046Cal> {
+    if b.len() < TOUCH_CAL_LEN {
+        return None;
+    }
+    let swap_xy = b[0] & TOUCH_CAL_FLAG_SWAP_XY != 0;
+    let x_min = u16::from_be_bytes([b[1], b[2]]);
+    let x_max = u16::from_be_bytes([b[3], b[4]]);
+    let y_min = u16::from_be_bytes([b[5], b[6]]);
+    let y_max = u16::from_be_bytes([b[7], b[8]]);
+    if x_min > 4095 || x_max > 4095 || y_min > 4095 || y_max > 4095 {
+        return None;
+    }
+    if (x_min as i32 - x_max as i32).abs() < 400 || (y_min as i32 - y_max as i32).abs() < 400 {
+        return None;
+    }
+    Some(crate::touch::Xpt2046Cal {
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        swap_xy,
+    })
 }
 
 #[cfg(kani)]

@@ -3,10 +3,11 @@
 
 //! [`rsk_rescue::Platform`] for the RP2350: read-only OTP secure-boot status (the
 //! PAC's OTP_DATA_RAW alias), a session RTC carried as an epoch base plus uptime
-//! (lost on power-cycle), the deferred reboot via the vendor applet's
-//! pending-reboot slot (run by the worker after the response has flushed), and
-//! the pass-throughs to [`crate::otp_keys`] for the two guarded one-way fuse
-//! writes (page-58 lock, rollback-required).
+//! (backed by the DS3231 RTC on `I2C1` when present, so time survives power-cycles),
+//! the deferred reboot via the vendor applet's pending-reboot slot (run by the
+//! worker after the response has flushed), and the pass-throughs to
+//! [`crate::otp_keys`] for the two guarded one-way fuse writes (page-58 lock,
+//! rollback-required).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -18,6 +19,34 @@ static UPTIME_AT_SET: AtomicU32 = AtomicU32::new(0);
 
 fn uptime_secs() -> u32 {
     embassy_time::Instant::now().as_secs() as u32
+}
+
+/// Read the current UTC Unix timestamp in seconds, either from the in-RAM epoch
+/// base or by probing the DS3231 RTC over `I2C1` and caching the result.
+pub fn current_unix_secs() -> Option<u64> {
+    if TIME_SET.load(Ordering::Relaxed) {
+        let base = EPOCH_AT_SET.load(Ordering::Relaxed) as u64;
+        let at = UPTIME_AT_SET.load(Ordering::Relaxed);
+        return Some(base + (uptime_secs().wrapping_sub(at) as u64));
+    }
+    let secs = crate::rtc::read_unix_secs()?;
+    if let Ok(epoch32) = u32::try_from(secs) {
+        EPOCH_AT_SET.store(epoch32, Ordering::Relaxed);
+        UPTIME_AT_SET.store(uptime_secs(), Ordering::Relaxed);
+        TIME_SET.store(true, Ordering::Relaxed);
+    }
+    Some(secs)
+}
+
+/// Set the current UTC Unix timestamp in seconds, updating both the in-RAM
+/// session clock and the DS3231 RTC on `I2C1` (if connected).
+pub fn set_unix_secs(secs: u64) -> bool {
+    if let Ok(epoch32) = u32::try_from(secs) {
+        EPOCH_AT_SET.store(epoch32, Ordering::Relaxed);
+        UPTIME_AT_SET.store(uptime_secs(), Ordering::Relaxed);
+        TIME_SET.store(true, Ordering::Relaxed);
+    }
+    crate::rtc::write_unix_secs(secs)
 }
 
 pub struct RescuePlatform;
@@ -65,18 +94,11 @@ impl Platform for RescuePlatform {
     }
 
     fn now(&self) -> Option<u32> {
-        if !TIME_SET.load(Ordering::Relaxed) {
-            return None;
-        }
-        let base = EPOCH_AT_SET.load(Ordering::Relaxed);
-        let at = UPTIME_AT_SET.load(Ordering::Relaxed);
-        Some(base.wrapping_add(uptime_secs().wrapping_sub(at)))
+        current_unix_secs().and_then(|s| u32::try_from(s).ok())
     }
 
     fn set_time(&mut self, epoch: u32) {
-        EPOCH_AT_SET.store(epoch, Ordering::Relaxed);
-        UPTIME_AT_SET.store(uptime_secs(), Ordering::Relaxed);
-        TIME_SET.store(true, Ordering::Relaxed);
+        let _ = set_unix_secs(epoch as u64);
     }
 
     fn request_reboot(&mut self, bootsel: bool) {

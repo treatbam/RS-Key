@@ -188,16 +188,63 @@ impl rsk_ui::scene::FrameTarget for Panel {
 /// debounce waits under test see what the real pad gives them.
 pub struct Pad {
     script: VecDeque<Option<rsk_ui::Point>>,
+    raw_script: VecDeque<Option<(u16, u16)>>,
     tail: Option<rsk_ui::Point>,
     pub reads: usize,
+    pub cal: rsk_ui::touch::Xpt2046Cal,
 }
 
 impl Pad {
     fn from(script: Vec<Option<rsk_ui::Point>>, tail: Option<rsk_ui::Point>) -> Self {
         Self {
             script: script.into(),
+            raw_script: VecDeque::new(),
             tail,
             reads: 0,
+            cal: rsk_ui::touch::Xpt2046Cal {
+                x_min: 300,
+                x_max: 3800,
+                y_min: 300,
+                y_max: 3800,
+                swap_xy: false,
+            },
+        }
+    }
+
+    pub fn raw_taps(raw_points: &[(u16, u16)], mapped_verify: Option<rsk_ui::Point>) -> Self {
+        const GAP: usize = 2;
+        let mut raw_script = VecDeque::new();
+        let mut script = VecDeque::new();
+        for _ in 0..GAP {
+            raw_script.push_back(None);
+            script.push_back(None);
+        }
+        for &rp in raw_points {
+            raw_script.push_back(Some(rp));
+            script.push_back(Some(rsk_ui::Point::new(0, 0)));
+            for _ in 0..GAP {
+                raw_script.push_back(None);
+                script.push_back(None);
+            }
+        }
+        if let Some(vp) = mapped_verify {
+            script.push_back(Some(vp));
+            for _ in 0..GAP {
+                script.push_back(None);
+            }
+        }
+        Self {
+            script,
+            raw_script,
+            tail: None,
+            reads: 0,
+            cal: rsk_ui::touch::Xpt2046Cal {
+                x_min: 300,
+                x_max: 3800,
+                y_min: 300,
+                y_max: 3800,
+                swap_xy: false,
+            },
         }
     }
 
@@ -242,6 +289,16 @@ impl Pad {
         Self::from(vec![None], Some(p))
     }
 
+    /// [`Self::taps`], then a finger down on `p` for three times the polls a hold needs to
+    /// commit, then lifted: the hold a confirm screen at the end of those taps waits for. A
+    /// flow that never commits, or reads on past it, sees the finger go instead of hanging.
+    pub fn taps_then_hold(points: &[rsk_ui::Point], p: rsk_ui::Point) -> Self {
+        let mut pad = Self::taps(points);
+        let polls = 3 * (HOLD_MS / TOUCH_POLL_MS) as usize;
+        pad.script.extend(vec![Some(p); polls]);
+        pad
+    }
+
     /// The exact sample sequence, for a case the shapes above do not describe.
     pub fn script(samples: &[Option<rsk_ui::Point>]) -> Self {
         Self::from(samples.to_vec(), None)
@@ -251,7 +308,22 @@ impl Pad {
 impl TouchPad for Pad {
     fn read(&mut self) -> Option<rsk_ui::Point> {
         self.reads += 1;
+        let _ = self.raw_script.pop_front();
         self.script.pop_front().unwrap_or(self.tail)
+    }
+
+    fn read_raw(&mut self) -> Option<(u16, u16)> {
+        self.reads += 1;
+        let _ = self.script.pop_front();
+        self.raw_script.pop_front().flatten()
+    }
+
+    fn calibration(&self) -> Option<rsk_ui::touch::Xpt2046Cal> {
+        Some(self.cal)
+    }
+
+    fn set_calibration(&mut self, cal: rsk_ui::touch::Xpt2046Cal) {
+        self.cal = cal;
     }
 }
 
@@ -290,7 +362,11 @@ pub struct Board {
     pub cancel_in: core::cell::Cell<Option<u32>>,
     /// A host command is queued — what makes a modal yield the executor.
     pub host_pending: bool,
+    /// The last reboot the flow asked for, as a record a test can assert.
     pub reboot: Option<bool>,
+    /// The device's reboot slot that request goes into, which a test takes from the way
+    /// `firmware/src/worker.rs` does.
+    pub slot: rsk_device::reboot::RebootSlot,
     pub presence_ms: u32,
     pub secure_boot: bool,
     pub attach_ms: u64,
@@ -298,6 +374,18 @@ pub struct Board {
     pub pin_changed: usize,
     /// …and how many times a failed clientPIN comparison at the pad did.
     pub pin_failed: usize,
+    /// How many times the pad fired the soft double-pulse PIN prompt haptic cue.
+    pub haptic_prompts: usize,
+    /// How many times the pad or blocked notice fired the PIN rejection haptic buzz.
+    pub haptic_errors: usize,
+    /// How many times a touch click or knob step fired the short touch haptic cue.
+    pub haptic_touches: usize,
+    /// How many times the 3-cue self-test fired.
+    pub haptic_tests: usize,
+    pub haptic_level: u8,
+    pub mute_pin_haptic: bool,
+    pub pin_pad_open: bool,
+    pub rtc_secs: Option<u64>,
 }
 
 impl Board {
@@ -311,6 +399,7 @@ impl Board {
             cancel_in: core::cell::Cell::new(None),
             host_pending: false,
             reboot: None,
+            slot: rsk_device::reboot::RebootSlot::new(),
             // Short enough that a flow which blocks to its presence timeout ends
             // inside a test rather than the device's 30 s.
             presence_ms: 400,
@@ -318,6 +407,14 @@ impl Board {
             attach_ms: 0,
             pin_changed: 0,
             pin_failed: 0,
+            haptic_prompts: 0,
+            haptic_errors: 0,
+            haptic_touches: 0,
+            haptic_tests: 0,
+            haptic_level: rsk_ui::HAPTIC_LEVEL_DEFAULT,
+            mute_pin_haptic: false,
+            pin_pad_open: false,
+            rtc_secs: None,
         }
     }
 
@@ -353,15 +450,46 @@ impl Hooks for Board {
     }
     fn request_reboot(&mut self, bootsel: bool) {
         self.reboot = Some(bootsel);
+        self.slot.queue(bootsel);
     }
     fn reboot_pending(&self) -> bool {
-        self.reboot.is_some()
+        self.slot.pending()
     }
     fn note_local_pin_changed(&mut self) {
         self.pin_changed += 1;
     }
     fn note_local_pin_failed(&mut self) {
         self.pin_failed += 1;
+    }
+    fn haptic_touch(&mut self) {
+        self.haptic_touches += 1;
+    }
+    fn haptic_pin_prompt(&mut self) {
+        self.haptic_prompts += 1;
+    }
+    fn haptic_pin_error(&mut self) {
+        self.haptic_errors += 1;
+    }
+    fn haptic_test_cues(&mut self) {
+        self.haptic_tests += 1;
+    }
+    fn haptic_level(&self) -> u8 {
+        self.haptic_level
+    }
+    fn set_haptic_level(&mut self, level: u8) {
+        self.haptic_level = level;
+    }
+    fn mute_pin_haptic(&self) -> bool {
+        self.mute_pin_haptic
+    }
+    fn set_mute_pin_haptic(&mut self, mute: bool) {
+        self.mute_pin_haptic = mute;
+    }
+    fn set_pin_pad_open(&mut self, open: bool) {
+        self.pin_pad_open = open;
+    }
+    fn rtc_unix_secs(&mut self) -> Option<u64> {
+        self.rtc_secs
     }
     fn secure_boot_enabled(&self) -> bool {
         self.secure_boot
@@ -567,6 +695,19 @@ pub fn center(r: rsk_ui::Rect) -> rsk_ui::Point {
 /// controls and clear of the nav bar, so a tap that must be a miss is one.
 pub fn nowhere() -> rsk_ui::Point {
     rsk_ui::Point::new(rsk_ui::PANEL_W - 1, 0)
+}
+
+/// The row of a settings list that `hit` reads as `want`, found through `rsk-ui`'s own
+/// hit test so a reordered list moves the tap with it.
+pub fn settings_row<E: PartialEq>(
+    rows: u16,
+    hit: impl Fn(rsk_ui::Point) -> Option<E>,
+    want: E,
+) -> rsk_ui::Point {
+    (0..rows)
+        .map(|i| center(rsk_ui::settings_row_rect(i)))
+        .find(|&p| hit(p).as_ref() == Some(&want))
+        .expect("the list has that row")
 }
 
 /// The cell that *paints* `key` under `layout`, found through `rsk-ui`'s own grid —
@@ -818,6 +959,8 @@ fn boot_restores_the_saved_display_settings() {
         sleep_secs: 15,
         pin_declined: false,
         scramble_pin: false,
+        haptic_level: 1,
+        mute_pin_haptic: true,
     };
     env.fs
         .borrow_mut()
@@ -831,6 +974,8 @@ fn boot_restores_the_saved_display_settings() {
     );
     // The backlight comes up at the saved level, not full — no bright flash to dim.
     assert_eq!(ui.hooks.backlight, level_duty(cfg.brightness));
+    assert_eq!(ui.hooks.haptic_level, cfg.haptic_level);
+    assert_eq!(ui.hooks.mute_pin_haptic, cfg.mute_pin_haptic);
 }
 
 #[test]
@@ -860,6 +1005,41 @@ fn a_host_ceremony_does_not_postpone_the_lock() {
     assert_eq!(LAST_LOCAL_MS.load(Ordering::Relaxed), local_before);
     note_local_activity();
     assert_ne!(LAST_LOCAL_MS.load(Ordering::Relaxed), local_before);
+}
+
+/// `firmware/src/worker.rs` around a queued reboot, for the tests that stand in for it:
+/// the idle tick that takes the request, and the wait `Worker::reboot` spends before its
+/// scrub and reset. Held to that source by [`the_worker_latches_the_reboot_slot_before_its_wait`].
+pub const WORKER_TICK_MS: u64 = 16;
+pub const WORKER_RESET_WAIT_MS: u64 = 200;
+
+/// The panel parks on the reboot slot only while the board latches it before the wait
+/// that yields to the panel — and the stand-in worker `status_tests.rs` drives it with
+/// proves that about the board only while it keeps the board's tick and wait.
+#[test]
+fn the_worker_latches_the_reboot_slot_before_its_wait() {
+    let raw = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../firmware/src/worker.rs"),
+    )
+    .expect("firmware/src/worker.rs");
+    let worker = strip_line_comments(&raw);
+    let reboot = fn_body(&worker, "async fn reboot(&mut self, mode: u8) -> !");
+    let latch = reboot.find("crate::vendor::begin_reset();");
+    let wait = reboot.find(".await");
+    assert!(
+        matches!((latch, wait), (Some(latch), Some(wait)) if latch < wait),
+        "`Worker::reboot` no longer latches the slot before its first await"
+    );
+    assert!(
+        reboot.contains(&format!(
+            "Timer::after(Duration::from_millis({WORKER_RESET_WAIT_MS})).await"
+        )),
+        "`Worker::reboot`'s wait moved away from the stand-in's"
+    );
+    assert!(
+        worker.contains(&format!("const BTN_POLL_MS: u64 = {WORKER_TICK_MS};")),
+        "the worker's idle tick moved away from the stand-in's"
+    );
 }
 
 /// `Worker::run` races several wake sources and `host_request_pending` decides

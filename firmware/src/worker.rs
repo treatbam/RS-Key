@@ -510,6 +510,16 @@ impl<'a> Worker<'a> {
                     }
                     Kind::Secure => &[], // handled above
                 };
+                if *kind == Kind::Cbor
+                    && let Some(&status) = r.first()
+                    && (status == rsk_fido::CtapError::PinInvalid as u8
+                        || status == rsk_fido::CtapError::PinBlocked as u8
+                        || status == rsk_fido::CtapError::PinAuthBlocked as u8
+                        || status == rsk_fido::CtapError::UvInvalid as u8
+                        || status == rsk_fido::CtapError::UvBlocked as u8)
+                {
+                    crate::haptic::pin_error();
+                }
                 let n = r.len().min(resp.len());
                 resp[..n].copy_from_slice(&r[..n]);
                 *resp_len = n;
@@ -611,6 +621,9 @@ impl<'a> Worker<'a> {
                     let body = self
                         .ccid
                         .handle_apdu(&apdu[..len], crate::usb_attach::elapsed_ms());
+                    if body.len() < 2 || body[body.len() - 2..] != rsk_sdk::Sw::OK.to_bytes() {
+                        crate::haptic::pin_error();
+                    }
                     let m = body.len().min(ex.resp.len());
                     ex.resp[..m].copy_from_slice(&body[..m]);
                     ex.resp_len = m;
@@ -698,6 +711,9 @@ impl<'a> Worker<'a> {
     /// while a pattern written through picoboot read straight back, so the platform
     /// clears it and there is nothing there to reach.
     async fn reboot(&mut self, mode: u8) -> ! {
+        // Before the wait, not after: the wait yields to the display, and a Management RESET's
+        // wipe reaches here with no request queued for its ambient loop to park on.
+        crate::vendor::begin_reset();
         embassy_time::Timer::after(Duration::from_millis(200)).await;
         self.ctap.scrub_secrets();
         self.ccid.scrub();

@@ -33,6 +33,7 @@ mod ccid_fido;
 pub mod click;
 mod ctap;
 pub mod presence;
+pub mod reboot;
 
 pub use ccid::CcidApplets;
 // The union is only reachable where a device-wide wipe is: `Management RESET` on
@@ -107,6 +108,53 @@ pub trait Hooks<S: rsk_fs::Storage> {
     /// - `Some(Some(key))` — the key.
     fn rsa_search(&mut self, _nbits: usize, _rng: &mut dyn rsk_sdk::Rng) -> SearchResult {
         None
+    }
+}
+
+/// End the host's session token once the trusted display re-keyed or rejected the
+/// clientPIN, or wiped the device. Both transports call this before they dispatch:
+/// whichever reads the one-shot signal first ends the token in the state they share.
+pub(crate) fn reset_token_on_local_pin_change<S: rsk_fs::Storage, R: rsk_sdk::Rng>(
+    hooks: &core::cell::RefCell<dyn Hooks<S>>,
+    fido_state: &core::cell::RefCell<rsk_fido::FidoState>,
+    rng: &core::cell::RefCell<R>,
+) {
+    if hooks.borrow_mut().local_pin_changed() {
+        let mut rngb = rng.borrow_mut();
+        fido_state.borrow_mut().reset_pin_uv_auth_token(&mut *rngb);
+        // The host path also clears `needs_power_cycle` here; that field is
+        // crate-private and leaving the RAM soft lock armed only fails closed
+        // (host clientPIN stays blocked until a replug), so it stays as it is.
+    }
+}
+
+/// Hand the clientPIN soft lock to the board after a dispatch on either transport. It is
+/// RAM-only, and a host can ask for `SCB::sys_reset` ungated (vendor or rescue 0x1F P1=00,
+/// the phy config-write reboot): a lock left behind refunds the §6.5.5.6 retry budget.
+pub(crate) fn persist_pin_lock<S: rsk_fs::Storage>(
+    hooks: &core::cell::RefCell<dyn Hooks<S>>,
+    fido_state: &core::cell::RefCell<rsk_fido::FidoState>,
+) {
+    hooks
+        .borrow_mut()
+        .store_pin_lock(fido_state.borrow().pin_lock());
+}
+
+/// Re-apply what a vendor (0x41) config write persisted but that lives outside the
+/// file system, after the dispatch that wrote it: the LED atomics (a no-op when
+/// unchanged), and a warm reboot if it changed the boot-only USB identity. Both
+/// transports call this for a 0x41 FIDO command.
+pub(crate) fn apply_vendor_config<S: rsk_fs::Storage>(
+    hooks: &core::cell::RefCell<dyn Hooks<S>>,
+    fs: &core::cell::RefCell<rsk_fs::Fs<S>>,
+) {
+    let mut fsb = fs.borrow_mut();
+    hooks.borrow_mut().config_written(&mut fsb);
+    if rsk_fido::vendor::take_phy_written() {
+        let phy = rsk_phy::load(&mut fsb).unwrap_or_default();
+        if phy.opts & rsk_phy::OPT_DISABLE_POWER_RESET == 0 {
+            hooks.borrow_mut().request_reboot();
+        }
     }
 }
 

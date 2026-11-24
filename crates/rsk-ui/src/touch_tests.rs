@@ -147,3 +147,52 @@ fn debounce_drops_a_jump() {
         Some(Point::new(200, 12))
     );
 }
+
+#[test]
+fn solve_xpt2046_cal_recovers_direct_and_swapped_axes() {
+    for swap in [false, true] {
+        for inv_x in [false, true] {
+            for inv_y in [false, true] {
+                let cal = Xpt2046Cal {
+                    x_min: if inv_x { 3820 } else { 240 },
+                    x_max: if inv_x { 240 } else { 3820 },
+                    y_min: if inv_y { 3880 } else { 280 },
+                    y_max: if inv_y { 280 } else { 3880 },
+                    swap_xy: swap,
+                };
+                // Synthesize raw ADC readings at the three calibration targets.
+                let raw_for = |target: Point| -> (u16, u16) {
+                    let rx = cal.x_min as i32
+                        + (target.x as i32 * (cal.x_max as i32 - cal.x_min as i32))
+                            / (PANEL_W as i32 - 1);
+                    let ry = cal.y_min as i32
+                        + (target.y as i32 * (cal.y_max as i32 - cal.y_min as i32))
+                            / (PANEL_H as i32 - 1);
+                    if swap {
+                        (ry as u16, rx as u16)
+                    } else {
+                        (rx as u16, ry as u16)
+                    }
+                };
+                let tl = raw_for(CAL_TARGET_TL);
+                let br = raw_for(CAL_TARGET_BR);
+                let tr = raw_for(CAL_TARGET_TR);
+                let solved = solve_xpt2046_cal(tl, br, tr).expect("valid 3-point calibration");
+                assert_eq!(solved.swap_xy, swap);
+                let center_raw = raw_for(CAL_TARGET_CENTER);
+                let mapped =
+                    xpt2046_map_raw(center_raw.0, center_raw.1, &solved).expect("mapped center");
+                assert!(
+                    mapped.x.abs_diff(CAL_TARGET_CENTER.x) <= 2
+                        && mapped.y.abs_diff(CAL_TARGET_CENTER.y) <= 2,
+                    "mapped center {mapped:?} drifted from {CAL_TARGET_CENTER:?}"
+                );
+            }
+        }
+    }
+    // Degenerate identical taps are rejected.
+    assert_eq!(
+        solve_xpt2046_cal((2000, 2000), (2000, 2000), (2000, 2000)),
+        None
+    );
+}

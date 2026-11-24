@@ -2,7 +2,7 @@
 // Copyright (C) 2026 RS-Key contributors
 
 use super::*;
-use crate::tests::{Env, Pad, center, nowhere};
+use crate::tests::{Env, Pad, center, nowhere, settings_row};
 
 #[test]
 fn an_adjust_page_decodes_only_minus_and_plus() {
@@ -23,26 +23,77 @@ fn back_on_an_adjust_page_returns_to_the_display_list() {
 
 #[test]
 fn the_display_list_drills_into_each_knob() {
+    let env = Env::new();
+    let mut ui = env.ui(Pad::idle());
+    let mut last = Instant::now();
     assert!(matches!(
-        settings_display(center(rsk_ui::TITLE_BACK_RECT)),
+        ui.settings_display(center(rsk_ui::TITLE_BACK_RECT), &mut last),
         Nav::Goto(SettingsPage::Root)
     ));
     for (i, want) in [
         SettingsPage::Brightness,
         SettingsPage::Sleep,
         SettingsPage::Timeout,
+        SettingsPage::Haptics,
     ]
     .into_iter()
     .enumerate()
     {
         let row = center(rsk_ui::settings_row_rect(i as u16));
-        let got = settings_display(row);
+        let got = ui.settings_display(row, &mut last);
         assert!(
             matches!(got, Nav::Goto(page) if page == want),
             "display row {i} does not open {want:?}"
         );
     }
-    assert!(matches!(settings_display(nowhere()), Nav::Idle));
+    // Row 4 is CalibrateTouch, which runs the guided calibration modal (no-op on Pad without cal)
+    // and stays on the Display page.
+    let cal_row = center(rsk_ui::settings_row_rect(4));
+    assert!(matches!(ui.settings_display(cal_row, &mut last), Nav::Stay));
+    assert!(matches!(
+        ui.settings_display(nowhere(), &mut last),
+        Nav::Idle
+    ));
+}
+
+#[test]
+fn haptics_page_cycles_level_toggles_pin_clicks_and_fires_test_cues() {
+    let env = Env::new();
+    let mut ui = env.ui(Pad::idle());
+    let mut dirty = false;
+
+    assert!(matches!(
+        ui.settings_haptics(center(rsk_ui::TITLE_BACK_RECT), &mut dirty),
+        Nav::Goto(SettingsPage::Display)
+    ));
+    assert!(!dirty);
+
+    // Row 0: cycle level (Default Medium=2 -> High=3 -> Off=0 -> Low=1 -> Medium=2).
+    let row0 = center(rsk_ui::settings_row_rect(0));
+    assert!(matches!(ui.settings_haptics(row0, &mut dirty), Nav::Stay));
+    assert_eq!(ui.hooks.haptic_level, 3);
+    assert_eq!(ui.hooks.haptic_touches, 1);
+    assert!(dirty);
+
+    // Row 1: toggle PIN pad clicks mute (false -> true).
+    let mut dirty2 = false;
+    let row1 = center(rsk_ui::settings_row_rect(1));
+    assert!(matches!(ui.settings_haptics(row1, &mut dirty2), Nav::Stay));
+    assert!(ui.hooks.mute_pin_haptic);
+    assert!(dirty2);
+
+    // Row 2: test cues (fires without dirtying flash).
+    let mut dirty3 = false;
+    let row2 = center(rsk_ui::settings_row_rect(2));
+    assert!(matches!(ui.settings_haptics(row2, &mut dirty3), Nav::Stay));
+    assert_eq!(ui.hooks.haptic_tests, 1);
+    assert!(!dirty3);
+
+    // Persists in EF_DISPLAY.
+    ui.save_display_config();
+    let saved = stored_display(&env.fs).expect("EF_DISPLAY written");
+    assert_eq!(saved.haptic_level, 3);
+    assert!(saved.mute_pin_haptic);
 }
 
 #[test]
@@ -212,6 +263,146 @@ fn the_scramble_row_toggles_in_place_and_persists() {
     assert!(!ui.scramble_pin);
 }
 
+/// `EF_DISPLAY` as the next boot would read it, if there is one.
+fn stored_display<S: rsk_fs::Storage>(fs: &RefCell<Fs<S>>) -> Option<rsk_ui::DisplayConfig> {
+    let mut buf = [0u8; rsk_ui::DISPLAY_CONF_LEN];
+    let n = fs.borrow_mut().read(EF_DISPLAY, &mut buf)?;
+    let mut cfg = rsk_ui::DisplayConfig::default();
+    cfg.apply_block(&buf[..n]);
+    Some(cfg)
+}
+
+/// A completed factory reset leaves the menu at once, writing nothing. An edit the debounce
+/// had not flushed rode the exit persist into the store the reset had just wiped, ahead of
+/// its queued reboot, and that reboot read both records back.
+#[test]
+fn a_factory_reset_writes_no_edit_into_the_store_it_wiped() {
+    let env = Env::new();
+    let taps = [
+        settings_row(
+            rsk_ui::SETTINGS_ROWS,
+            rsk_ui::hit_settings_root,
+            RootEntry::Display,
+        ),
+        settings_row(
+            rsk_ui::DISPLAY_ROWS,
+            rsk_ui::hit_display,
+            DisplayEntry::Timeout,
+        ),
+        center(rsk_ui::ADJ_PLUS_RECT),
+        center(rsk_ui::TITLE_BACK_RECT),
+        center(rsk_ui::TITLE_BACK_RECT),
+        settings_row(
+            rsk_ui::SETTINGS_ROWS,
+            rsk_ui::hit_settings_root,
+            RootEntry::Security,
+        ),
+        settings_row(
+            rsk_ui::SECURITY_ROWS,
+            rsk_ui::hit_security,
+            SecurityEntry::ScramblePin,
+        ),
+        settings_row(
+            rsk_ui::SECURITY_ROWS,
+            rsk_ui::hit_security,
+            SecurityEntry::FactoryReset,
+        ),
+    ];
+    let mut ui = env.ui(Pad::taps_then_hold(&taps, center(rsk_ui::DEL_HOLD_RECT)));
+    // What declining onboarding leaves behind, so the wipe has a record to remove.
+    ui.pin_declined = true;
+    ui.save_display_config();
+
+    let started = Instant::now();
+    ui.run_settings();
+    // Well inside the menu's own idle exit, which a menu still open over the wipe waits out.
+    let left_at_once = started.elapsed() < Duration::from_millis(MENU_INACTIVITY_MS / 2);
+    let phy = env.fs.borrow_mut().has_data(rsk_phy::EF_PHY);
+    assert_eq!(
+        (ui.hooks.reboot, stored_display(&env.fs), phy, left_at_once),
+        (Some(false), None, false, true),
+        "a completed reset must leave the menu at once, with no display or phy record \
+         for its reboot to read"
+    );
+}
+
+/// A firmware update's reboot keeps an edit the user has watched take effect, as every
+/// other exit does: it wipes nothing, and the image is replaced under the store.
+#[test]
+fn an_edit_is_written_before_a_firmware_update_reboots() {
+    let env = Env::new();
+    let taps = [
+        settings_row(
+            rsk_ui::SETTINGS_ROWS,
+            rsk_ui::hit_settings_root,
+            RootEntry::Display,
+        ),
+        settings_row(
+            rsk_ui::DISPLAY_ROWS,
+            rsk_ui::hit_display,
+            DisplayEntry::Brightness,
+        ),
+        center(rsk_ui::ADJ_MINUS_RECT),
+        center(rsk_ui::TITLE_BACK_RECT),
+        center(rsk_ui::TITLE_BACK_RECT),
+        settings_row(
+            rsk_ui::SETTINGS_ROWS,
+            rsk_ui::hit_settings_root,
+            RootEntry::Firmware,
+        ),
+    ];
+    let mut ui = env.ui(Pad::taps_then_hold(&taps, center(rsk_ui::DEL_HOLD_RECT)));
+    ui.set_brightness(BRIGHTNESS_LEVELS);
+
+    ui.run_settings();
+    assert_eq!(
+        (
+            ui.hooks.reboot,
+            stored_display(&env.fs).map(|cfg| cfg.brightness)
+        ),
+        (Some(true), Some(BRIGHTNESS_LEVELS - 1)),
+        "the brightness step must be on flash before the update reboot"
+    );
+}
+
+/// Only a completed wipe drops the edit: a reset abandoned at its confirm screen falls back
+/// to the Security page, and the edit is written when the menu is left.
+#[test]
+fn an_abandoned_factory_reset_keeps_the_edit() {
+    let env = Env::new();
+    let taps = [
+        settings_row(
+            rsk_ui::SETTINGS_ROWS,
+            rsk_ui::hit_settings_root,
+            RootEntry::Security,
+        ),
+        settings_row(
+            rsk_ui::SECURITY_ROWS,
+            rsk_ui::hit_security,
+            SecurityEntry::ScramblePin,
+        ),
+        settings_row(
+            rsk_ui::SECURITY_ROWS,
+            rsk_ui::hit_security,
+            SecurityEntry::FactoryReset,
+        ),
+        center(rsk_ui::PK_BACK_RECT),
+        center(rsk_ui::TITLE_BACK_RECT),
+        center(rsk_ui::nav_tab_rect(0)),
+    ];
+    let mut ui = env.ui(Pad::taps(&taps));
+
+    ui.run_settings();
+    assert_eq!(
+        (
+            ui.hooks.reboot,
+            stored_display(&env.fs).map(|cfg| cfg.scramble_pin)
+        ),
+        (None, Some(true)),
+        "an abandoned reset must neither reboot nor lose the scramble toggle"
+    );
+}
+
 /// The touch-timeout save carried its own copy of the phy read-modify-write — a
 /// `load(..).unwrap_or_default()` — so a probe the flash could not answer read as
 /// "no record was ever written" and the exit path saved a DEFAULT record with the
@@ -255,4 +446,69 @@ fn a_faulted_phy_probe_does_not_wipe_the_record_the_timeout_shares() {
         before.len()
     );
     assert_eq!(after, before, "a refused save must leave the record alone");
+}
+
+#[test]
+fn guided_touch_calibration_persists_on_center_hit_and_reverts_on_miss() {
+    let env = Env::new();
+    let cal = rsk_ui::touch::Xpt2046Cal {
+        x_min: 350,
+        x_max: 3750,
+        y_min: 300,
+        y_max: 3800,
+        swap_xy: false,
+    };
+    let raw_for = |c: rsk_ui::touch::Xpt2046Cal, target: rsk_ui::Point| -> (u16, u16) {
+        let rx = c.x_min as i32
+            + (target.x as i32 * (c.x_max as i32 - c.x_min as i32)) / (rsk_ui::PANEL_W as i32 - 1);
+        let ry = c.y_min as i32
+            + (target.y as i32 * (c.y_max as i32 - c.y_min as i32)) / (rsk_ui::PANEL_H as i32 - 1);
+        if c.swap_xy {
+            (ry as u16, rx as u16)
+        } else {
+            (rx as u16, ry as u16)
+        }
+    };
+    let raw_tl = raw_for(cal, rsk_ui::touch::CAL_TARGET_TL);
+    let raw_br = raw_for(cal, rsk_ui::touch::CAL_TARGET_BR);
+    let raw_tr = raw_for(cal, rsk_ui::touch::CAL_TARGET_TR);
+    let expected_cal =
+        rsk_ui::touch::solve_xpt2046_cal(raw_tl, raw_br, raw_tr).expect("valid solved cal");
+
+    // 1. Center verification tap within tolerance -> persists EF_TOUCH_CAL.
+    let mut ui = env.ui(Pad::raw_taps(
+        &[raw_tl, raw_br, raw_tr],
+        Some(rsk_ui::touch::CAL_TARGET_CENTER),
+    ));
+    ui.run_touch_calibration();
+    assert_eq!(ui.touch.cal, expected_cal);
+    let mut buf = [0u8; rsk_ui::TOUCH_CAL_LEN];
+    let n = env
+        .fs
+        .borrow_mut()
+        .read(EF_TOUCH_CAL, &mut buf)
+        .expect("EF_TOUCH_CAL written");
+    assert_eq!(rsk_ui::decode_touch_cal(&buf[..n]), Some(expected_cal));
+
+    // 2. Center verification tap misses target -> reverts to previous calibration.
+    let bad_cal = rsk_ui::touch::Xpt2046Cal {
+        x_min: 500,
+        x_max: 3500,
+        y_min: 500,
+        y_max: 3500,
+        swap_xy: true,
+    };
+    let bad_tl = raw_for(bad_cal, rsk_ui::touch::CAL_TARGET_TL);
+    let bad_br = raw_for(bad_cal, rsk_ui::touch::CAL_TARGET_BR);
+    let bad_tr = raw_for(bad_cal, rsk_ui::touch::CAL_TARGET_TR);
+    let mut ui_miss = env.ui(Pad::raw_taps(
+        &[bad_tl, bad_br, bad_tr],
+        Some(rsk_ui::Point::new(10, 10)),
+    ));
+    ui_miss.touch.cal = expected_cal;
+    ui_miss.run_touch_calibration();
+    assert_eq!(
+        ui_miss.touch.cal, expected_cal,
+        "missed verification tap must revert to previous calibration"
+    );
 }

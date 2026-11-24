@@ -2,7 +2,7 @@
 // Copyright (C) 2026 RS-Key contributors
 
 use super::*;
-use crate::tests::{Env, apdu, select, sw};
+use crate::tests::{Env, apdu, dev, get_creds_metadata, select, sw, wrong_pin_token_request};
 
 /// U2F VERSION — the one U2F command that touches no credential and needs no
 /// touch, so it can stand for "did this reach the FIDO applet?".
@@ -152,6 +152,28 @@ fn a_cold_boot_is_the_default() {
 }
 
 #[test]
+fn the_soft_lock_handed_over_is_the_one_the_command_left() {
+    // A hand-over taken before the dispatch counts the same and is one command stale:
+    // a reboot right after the third wrong PIN would find the second one's batch.
+    let env = Env::new();
+    let mut ctap = env.ctap();
+    rsk_fido::passkeys::store_local_pin(&dev(), &mut env.fs.borrow_mut(), b"123456")
+        .expect("the test PIN meets the default policy");
+    let wrong = wrong_pin_token_request();
+    for _ in 0..rsk_fido::consts::PIN_MISMATCH_LIMIT {
+        ctap.handle_cbor(1, &wrong, 0);
+    }
+    assert_eq!(
+        env.board.borrow().pin_locks.last().copied(),
+        Some(rsk_fido::state::PinLock {
+            engaged: true,
+            mismatches: rsk_fido::consts::PIN_MISMATCH_LIMIT,
+        }),
+        "the lock handed over after the third wrong PIN is not the one it left"
+    );
+}
+
+#[test]
 fn the_channel_asking_is_recorded_on_every_command() {
     // Cross-message state a second process on its own CTAPHID channel must not be
     // able to ride binds to this.
@@ -170,12 +192,26 @@ fn a_panel_pin_change_is_consumed_before_the_next_command_runs() {
     // Set on the display task and consumed here, once: a session credential the
     // old PIN authorized must not survive into the command after the re-key.
     let env = Env::new();
-    env.board.borrow_mut().local_pin_change = true;
     let mut ctap = env.ctap();
-    ctap.handle_cbor(1, &GET_INFO, 0);
-    assert!(
-        !env.board.borrow().local_pin_change,
-        "the one-shot flag was not read"
+    // A live cm-permission token, as getPinUvAuthTokenUsingPinWithPermissions leaves one.
+    {
+        let mut state = env.fido_state.borrow_mut();
+        state.reset_pin_uv_auth_token(&mut *env.rng.borrow_mut());
+        state.begin_using_token(false, 0);
+        state.paut.permissions = rsk_fido::state::PERM_CM;
+    }
+    let metadata = get_creds_metadata(&env.fido_state.borrow().paut.token);
+
+    let before = ctap.handle_cbor(1, &metadata, 0)[0];
+    env.board.borrow_mut().local_pin_change = true;
+    let after = ctap.handle_cbor(1, &metadata, 0)[0];
+    assert_eq!(
+        (before, after),
+        (
+            rsk_fido::CTAP2_OK,
+            rsk_fido::CtapError::PinAuthInvalid.as_u8()
+        ),
+        "the token the old PIN authorized must stop verifying once the panel changed it"
     );
 }
 
@@ -186,6 +222,9 @@ fn a_vendor_command_reapplies_the_configuration_outside_flash() {
     // A vendor CONFIG_WRITE persists the LED block, but its live copy is a set of
     // atomics the flash record does not reach — so the board is told after any
     // 0x41, matching the CCID SET_LED.
+    let _phy = crate::tests::PHY_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let env = Env::new();
     let mut ctap = env.ctap();
     ctap.handle_cbor(1, &[rsk_fido::consts::CTAP_VENDOR], 0);
@@ -205,6 +244,9 @@ fn an_ordinary_command_does_not_touch_the_configuration() {
 fn nothing_reboots_without_a_phy_write() {
     // The auto-reboot exists so a changed USB identity takes effect without a
     // replug; it must not fire for any other vendor command.
+    let _phy = crate::tests::PHY_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let env = Env::new();
     let mut ctap = env.ctap();
     ctap.handle_cbor(1, &[rsk_fido::consts::CTAP_VENDOR], 0);

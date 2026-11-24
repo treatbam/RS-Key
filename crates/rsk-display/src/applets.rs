@@ -1060,9 +1060,11 @@ where
         next
     }
 
-    /// Build one OATH credential's detail by its global list position. Re-enumerates (the
-    /// display holds no secret), clamps the picked credential's metadata for display.
-    fn load_oath_cred(&self, idx: usize) -> rsk_ui::OathDetailView {
+    /// Build one OATH credential's detail by its global list position, computing its
+    /// live TOTP code + remaining validity seconds when an external RTC clock is synced
+    /// and the credential is not waiting on a touch-to-reveal tap.
+    fn load_oath_cred(&mut self, idx: usize, revealed: bool) -> rsk_ui::OathDetailView {
+        let rtc_now = self.hooks.rtc_unix_secs();
         let mkek = read_fused(self.keys.mkek_source);
         let dev = self.keys.device(&mkek);
         let mut fs = self.fs.borrow_mut();
@@ -1077,23 +1079,38 @@ where
                     digits: c.digits,
                     period: c.period,
                     touch: c.touch,
+                    code: None,
+                    remaining_secs: 0,
+                    clock_set: rtc_now.is_some(),
                 };
             }
             i += 1;
         });
+        if !view.hotp
+            && (!view.touch || revealed)
+            && let Some(unix_secs) = rtc_now
+            && let Some(live) = rsk_oath::compute_totp_at(&dev, &mut fs, idx, unix_secs)
+        {
+            view.code = Some(live.code);
+            view.remaining_secs = live.remaining_secs;
+        }
         view
     }
 
-    /// One OATH credential's detail screen (back-only, no nav). Read-only; back chevron /
-    /// power button / a queued host command / inactivity all return to the list.
+    /// One OATH credential's detail screen (back-only, no nav). When an external RTC
+    /// (such as the DS3231) provides valid UTC seconds, refreshes a TOTP credential's
+    /// live code and countdown once per second via retained damage, and honours
+    /// `PROP_TOUCH` by requiring a tap on the code card before revealing the code.
     fn run_oath_cred(&mut self, idx: usize) {
-        let view = self.load_oath_cred(idx);
+        let mut revealed = false;
+        let mut view = self.load_oath_cred(idx, revealed);
         let _ = rsk_ui::render_oath_cred(&mut self.frame(), &view);
         self.shown = None;
         self.touch
             .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let mut last = Instant::now();
+        let mut last_rtc_poll = Instant::now();
         loop {
             if self.sleep_button_pressed() {
                 break;
@@ -1103,7 +1120,23 @@ where
                 if rsk_ui::hit_title_back(p) {
                     break;
                 }
+                if !view.hotp && view.touch && !revealed && rsk_ui::hit_oath_reveal(p) {
+                    revealed = true;
+                    let next = self.load_oath_cred(idx, revealed);
+                    let _ = rsk_ui::render_oath_cred_code(&mut self.damage_frame(), &next);
+                    view = next;
+                }
                 self.touch.wait_release(last, idle_limit);
+            }
+            if !view.hotp && last_rtc_poll.elapsed() >= Duration::from_millis(250) {
+                last_rtc_poll = Instant::now();
+                let next = self.load_oath_cred(idx, revealed);
+                if (next.code, next.remaining_secs, next.clock_set)
+                    != (view.code, view.remaining_secs, view.clock_set)
+                {
+                    let _ = rsk_ui::render_oath_cred_code(&mut self.damage_frame(), &next);
+                    view = next;
+                }
             }
             if self.hooks.host_request_pending_after(last) || last.elapsed() >= idle_limit {
                 break;

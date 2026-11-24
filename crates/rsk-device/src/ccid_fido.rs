@@ -28,6 +28,15 @@ const INS_CTAP_GETRESPONSE: u8 = 0x11;
 /// The `P1` that makes a GETRESPONSE a cancel rather than a poll.
 const P1_CANCEL: u8 = 0x11;
 
+/// Whether `apdu` is a CTAP2 vendor (0x41) command for the FIDO applet — the CCID
+/// twin of the CTAPHID handler's `data.first() == CTAP_VENDOR`, so the router can run
+/// the same post-write side effects (the LED reload and phy reboot).
+pub(crate) fn is_vendor_cbor(apdu: &Apdu) -> bool {
+    apdu.cla == CLA_PROPRIETARY
+        && apdu.ins == INS_CTAP_MSG
+        && apdu.data.first() == Some(&rsk_fido::consts::CTAP_VENDOR)
+}
+
 /// FIDO over CCID. Holds no FIDO state of its own; every field is a handle the
 /// CTAPHID transport also holds.
 pub struct FidoCcidApplet<'a, R: rsk_sdk::Rng + 'static> {
@@ -37,7 +46,7 @@ pub struct FidoCcidApplet<'a, R: rsk_sdk::Rng + 'static> {
     /// the restart-by-reboot attack `FidoState::restore_pin_lock` exists to close.
     /// It also carries the PIN/UV token, the credential-management walk and the
     /// soft lock's RAM seed, none of which may fork per transport.
-    state: &'a RefCell<rsk_fido::FidoState>,
+    pub(crate) state: &'a RefCell<rsk_fido::FidoState>,
     rng: &'a RefCell<R>,
     presence: &'a RefCell<dyn rsk_sdk::UserPresence>,
     serial_id: [u8; 8],

@@ -67,6 +67,38 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   existing ILI9341 and RP2350-Touch-LCD-2.8 presets keep their pins, buses and
   clocks. Wiring: [docs/hardware.md](docs/hardware.md#stacked-the-zero-soldered-straight-onto-the-modules-header).
   `bcdDevice` 0x09DC.
+- **Optional haptic feedback for touch, PIN prompt, and PIN rejection**
+  (`HAPTIC_KIND=none|pwm|drv2605` / board TOML `[haptic]` section). Runs as a
+  non-blocking Embassy task on the high-priority executor that coalesces concurrent
+  requests (`PinError` > `PinPrompt` > `Touch`) so haptics never stall touch
+  sampling or cryptographic operations, and triggers PIN-rejection cues only after
+  verification outcomes are decided (preserving constant-time comparison paths).
+  Supports a direct GPIO PWM ERM coin-motor backend (`HAPTIC_KIND=pwm`, default
+  `HAPTIC_PIN=26` on PWM slice 5 channel A at ~19.5 kHz carrier: 18 ms 100% touch
+  pulse, two 35 ms ~40% soft pulses separated by 65 ms on PIN prompt, 450 ms 100%
+  buzz on PIN error) and a TI DRV2605L I2C1 backend (`HAPTIC_KIND=drv2605`, default
+  `HAPTIC_I2C_SDA=14` / `HAPTIC_I2C_SCL=15` at 400 kHz with ERM Library A or LRA
+  Library F selected via `HAPTIC_ACTUATOR=erm|lra`, sharing I2C1 through a static
+  `embassy_sync` mutex for future peripherals such as an RTC). Default
+  `HAPTIC_KIND=none` compiles zero haptic code and claims no pins. Wiring and
+  knobs: [docs/hardware.md](docs/hardware.md#optional-haptic-feedback-haptic_kind),
+  [docs/build.md](docs/build.md#environment-variables).
+- **DS3231 RTC-backed live on-device TOTP, guided XPT2046 touch calibration, and
+  on-device haptic settings.** Drives a DS3231 RTC (`0x68`) on `I2C1` (GP14 SDA /
+  GP15 SCL, shared with the DRV2605L via `rtc::SharedI2c1`), checking the
+  Oscillator Stop Flag (`OSF`) and writing host time updates (`set_time`) through
+  to battery-backed BCD registers so **Apps → OATH → `<credential>`** displays and
+  refreshes live 6–8 digit TOTP codes and countdowns once per second (honouring
+  `PROP_TOUCH` with tap-to-reveal and keeping HOTP read-only). Adds **Settings →
+  Display → Haptics** (runtime `Off`/`Low`/`Medium`/`High` intensity, `PIN pad
+  clicks` mute for acoustic privacy, and `Test cues`, persisted in `EF_DISPLAY`)
+  and **Settings → Display → Calibrate touch** (guided 3-point crosshair tap +
+  center verification target with auto-revert on miss/timeout, persisted in
+  `EF_TOUCH_CAL`). Tunes the PWM ERM driver to a two-stage overdrive + sustain
+  envelope for phone ERM rotor inertia and adds 3-sample release hysteresis on
+  XPT2046 touch clicks. Ports upstream security and bug fixes (`c491df44`,
+  `4f221163`, `f8e825df`, `8d944c42`, `2c3decef`, `ea5de658`, `1f1467c5`,
+  `19cd5711`). `bcdDevice` 0x09DD.
 
 ## [0.4.11] - 2026-09-08
 

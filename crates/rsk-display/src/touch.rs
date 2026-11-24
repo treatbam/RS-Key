@@ -19,6 +19,20 @@ pub trait TouchPad {
     /// error reads as "no touch".
     fn read(&mut self) -> Option<rsk_ui::Point>;
 
+    /// Raw median ADC reading `(rx, ry)` for a resistive touch panel (such as the
+    /// XPT2046) during interactive calibration. Capacitive panels return `None`.
+    fn read_raw(&mut self) -> Option<(u16, u16)> {
+        None
+    }
+
+    /// Active resistive touch calibration, if the controller uses one.
+    fn calibration(&self) -> Option<rsk_ui::touch::Xpt2046Cal> {
+        None
+    }
+
+    /// Replace the active resistive touch calibration at runtime.
+    fn set_calibration(&mut self, _cal: rsk_ui::touch::Xpt2046Cal) {}
+
     /// Block until the finger lifts (bounded by `start + timeout`), so one tap maps
     /// to one key press — a panel reports contact continuously while touched. Used
     /// by the PIN pad, where a held finger must not machine-gun a digit.

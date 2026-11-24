@@ -99,3 +99,68 @@ fn the_cardholder_reader_can_always_see_a_truncation() {
     let long = [b'x'; rsk_ui::LABEL_MAX + 1];
     assert!(Label::clamp(&long).truncated);
 }
+
+#[test]
+fn load_oath_cred_computes_live_totp_when_rtc_is_set_and_gates_touch_creds() {
+    let env = Env::new();
+    let mut ui = env.ui(Pad::idle());
+
+    // Store an 8-digit SHA-1 TOTP credential (RFC 6238 vector at t = 59 -> 94287082).
+    // TLV format: 0x71 len name, 0x73 len (type|algo, digits, secret), optional 0x78 0x01 0x02 (touch).
+    let name = b"GitHub:alice";
+    let secret = b"12345678901234567890";
+    let mut rec = Vec::new();
+    rec.push(0x71);
+    rec.push(name.len() as u8);
+    rec.extend_from_slice(name);
+    rec.push(0x73);
+    rec.push((2 + secret.len()) as u8);
+    rec.push(0x21); // TOTP | SHA-1
+    rec.push(8); // 8 digits
+    rec.extend_from_slice(secret);
+    env.fs
+        .borrow_mut()
+        .put(0xBA00, &rec)
+        .expect("write OATH cred");
+    {
+        let mkek = read_fused(ui.keys.mkek_source);
+        let dev = ui.keys.device(&mkek);
+        let mut rng = env.rng.borrow_mut();
+        let mut fs = env.fs.borrow_mut();
+        rsk_oath::migrate_seal(&dev, &mut fs, &mut *rng);
+    }
+
+    // 1. Without RTC clock set -> clock_set = false, code = None.
+    ui.hooks.rtc_secs = None;
+    let v_unset = ui.load_oath_cred(0, false);
+    assert!(!v_unset.clock_set);
+    assert_eq!(v_unset.code, None);
+
+    // 2. With DS3231 RTC at t = 59 -> live 8-digit TOTP code 94287082, 1s remaining.
+    ui.hooks.rtc_secs = Some(59);
+    let v_live = ui.load_oath_cred(0, false);
+    assert!(v_live.clock_set);
+    assert_eq!(v_live.code, Some(94_287_082));
+    assert_eq!(v_live.remaining_secs, 1);
+
+    // 3. When PROP_TOUCH (tag 0x78, len 1, val 0x02) is set, code stays hidden until revealed = true.
+    rec.extend_from_slice(&[0x78, 0x01, 0x02]);
+    env.fs
+        .borrow_mut()
+        .put(0xBA00, &rec)
+        .expect("write touch OATH cred");
+    {
+        let mkek = read_fused(ui.keys.mkek_source);
+        let dev = ui.keys.device(&mkek);
+        let mut rng = env.rng.borrow_mut();
+        let mut fs = env.fs.borrow_mut();
+        rsk_oath::migrate_seal(&dev, &mut fs, &mut *rng);
+    }
+    let v_hidden = ui.load_oath_cred(0, false);
+    assert!(v_hidden.touch);
+    assert!(v_hidden.clock_set);
+    assert_eq!(v_hidden.code, None);
+
+    let v_revealed = ui.load_oath_cred(0, true);
+    assert_eq!(v_revealed.code, Some(94_287_082));
+}

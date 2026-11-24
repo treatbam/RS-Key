@@ -110,6 +110,7 @@ pub fn backlight_cfg(duty: u16) -> PwmConfig {
 #[cfg(display_panel = "st7789")]
 pub struct Touch {
     i2c: I2c<'static, I2C1, I2cBlocking>,
+    down: bool,
 }
 
 #[cfg(display_panel = "st7789")]
@@ -138,6 +139,14 @@ impl TouchPad for Touch {
         };
         // Clear register 0xD005 (write address + a 0 byte) to ack the report.
         let _ = self.i2c.blocking_write(CST328_ADDR, &[0xD0, 0x05, 0x00]);
+        if pt.is_some() {
+            if !self.down {
+                self.down = true;
+                crate::haptic::pulse_touch();
+            }
+        } else {
+            self.down = false;
+        }
         pt
     }
 }
@@ -214,6 +223,46 @@ impl rsk_display::Hooks for DisplayHooks {
     /// there would then fire on a failed check too.
     fn note_local_pin_failed(&mut self) {
         crate::handler::note_local_pin_changed();
+    }
+
+    fn haptic_touch(&mut self) {
+        crate::haptic::pulse_touch();
+    }
+
+    fn haptic_pin_prompt(&mut self) {
+        crate::haptic::pin_prompt();
+    }
+
+    fn haptic_pin_error(&mut self) {
+        crate::haptic::pin_error();
+    }
+
+    fn haptic_test_cues(&mut self) {
+        crate::haptic::test_cues();
+    }
+
+    fn haptic_level(&self) -> u8 {
+        crate::haptic::level()
+    }
+
+    fn set_haptic_level(&mut self, level: u8) {
+        crate::haptic::set_level(level);
+    }
+
+    fn mute_pin_haptic(&self) -> bool {
+        crate::haptic::mute_pin()
+    }
+
+    fn set_mute_pin_haptic(&mut self, mute: bool) {
+        crate::haptic::set_mute_pin(mute);
+    }
+
+    fn set_pin_pad_open(&mut self, open: bool) {
+        crate::haptic::set_pin_pad_open(open);
+    }
+
+    fn rtc_unix_secs(&mut self) -> Option<u64> {
+        crate::rescue_platform::current_unix_secs()
     }
 
     fn secure_boot_enabled(&self) -> bool {
@@ -317,7 +366,7 @@ pub fn build(
         block_for(Duration::from_millis(10));
         tp_rst.set_high();
         block_for(Duration::from_millis(50));
-        let mut touch = Touch { i2c };
+        let mut touch = Touch { i2c, down: false };
         touch.normal_mode();
         let hooks = DisplayHooks {
             bl,

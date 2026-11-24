@@ -145,15 +145,15 @@ What differs from the 2.8″ board:
   is too light or a burst that spreads more than a few pixels. A contact counts
   once two reads in a row agree. Press with a fingernail or stylus. A resting palm
   or a light brush is not a tap.
-- **Calibration is build-time.** `touch_x_min`/`touch_x_max`/`touch_y_min`/
-  `touch_y_max` give the raw 12-bit reading at the panel's left/right/top/bottom
-  edge; a `min` above its `max` flips the axis, and `touch_swap_xy = true` swaps
-  the axes. The defaults (`3800`/`300`/`300`/`3800`, no swap) fit the common
-  module under the default orientation. If taps land mirrored, swap that axis's
-  `min` and `max`; if horizontal taps move vertically, set `touch_swap_xy`. There
-  is **no on-device calibration screen and no raw-value readout yet**. To measure
-  a module, read its corners with any XPT2046 test sketch and put the numbers in
-  the board file.
+- **Calibration is build-time seeded and runtime-calibratable on-device.**
+  `touch_x_min`/`touch_x_max`/`touch_y_min`/`touch_y_max` give the boot-default raw
+  12-bit reading at the panel's left/right/top/bottom edge; a `min` above its `max`
+  flips the axis, and `touch_swap_xy = true` swaps the axes. The defaults
+  (`3800`/`300`/`300`/`3800`, no swap) fit the common module under the default
+  orientation. On-device, open **Settings → Display → Calibrate touch** to run a
+  guided 3-point crosshair tap + center verification target; a verified calibration
+  is persisted to `EF_TOUCH_CAL` (`0xE031`) across reboots (and automatically
+  reverts if timed out or missed so a bad tap can never lock out the touch screen).
 
 > ⚠️ **Hand-wired means the wires are part of the trusted display.** The ceremony
 > rests on "a tap on a screen showing the true relying party". With the bus on
@@ -225,6 +225,118 @@ What differs from the hand-wired build:
 - The stacked header removes the loose bus wires but not the jumpers: `T_DIN`,
   `T_DO` and `T_IRQ` still run on wires, so the case warning above still holds.
 
+#### Optional haptic feedback (`HAPTIC_KIND`)
+
+A haptic motor can be wired to the stacked board (or any board) to give tactile
+cues on three events:
+
+1. **Touch pulse:** a short sharp pulse (~18–20 ms) on the rising edge of each
+   registered touch contact.
+2. **PIN prompt:** a dull double-pulse cue (two soft, low-intensity pulses) when
+   the PIN pad opens for entry.
+3. **PIN rejection:** one long buzz (~450 ms) when a PIN is rejected (on-screen
+   PIN pad retry/lockout, CTAP2 clientPIN / built-in UV rejection, or CCID pinpad
+   `VERIFY` failure). Triggered only after the verification result is decided,
+   never inside constant-time comparison paths.
+
+Haptics run in a dedicated non-blocking Embassy task; events coalesce (`PinError`
+overrides `PinPrompt`, which overrides `Touch`) and never delay touch sampling or
+crypto work. By default `HAPTIC_KIND=none` compiles zero haptic code and claims
+no pins.
+
+Two hardware backends are supported at compile time via `[haptic]` in the board
+TOML or environment overrides:
+
+- **Direct PWM ERM coin motor (`HAPTIC_KIND=pwm`):** drives an eccentric rotating
+  mass (ERM) pancake motor from a GPIO PWM output (`HAPTIC_PIN`, default **GP26**,
+  PWM slice 5 channel A at ~19.5 kHz carrier; duty cycle sets intensity: 100% for
+  touch and error buzz, ~40% for the soft double-pulse prompt). Because a bare
+  RP2350 GPIO cannot source the 50–100 mA an ERM motor draws, switch the motor on
+  the low side through an **N-channel MOSFET** (e.g. AO3400 / 2N7002, with a
+  100 Ω series gate resistor and a 10 kΩ gate-to-GND pull-down) or **NPN
+  transistor** (e.g. S8050 / 2N2222 with a 1 kΩ base resistor), powered from the
+  3V3 rail (or VBUS 5V through a series current-limiting resistor sized for the
+  3 V motor rating), and place a **flyback diode** (e.g. 1N5819 Schottky or
+  1N4148, cathode to `+V`, anode to the motor negative / drain / collector)
+  directly across the motor terminals to clamp inductive kickback, plus a 100 nF
+  ceramic decoupling capacitor across the motor leads:
+
+  ```text
+  3V3 (or 5V + R_lim) ──┬──────────(+) ERM Motor (-)──────────┬── Drain / Collector
+                        │                                     │
+                     [Diode] 1N5819 (cathode ↑, anode ↓)   [100 nF]
+                        │                                     │
+                        └─────────────────────────────────────┤
+                                                              │
+  GP26 (PWM 5A) ──[100 Ω]──┬── Gate / Base      Source / Emitter ── GND
+                        [10 kΩ]
+                           └── GND
+  ```
+
+  ```sh
+  env BOARD=waveshare-zero-ili9341-stacked HAPTIC_KIND=pwm \
+      cargo build --release -p firmware --features display
+  ```
+
+- **TI DRV2605L haptic driver on I2C1 (`HAPTIC_KIND=drv2605`):** drives an ERM or
+  LRA actuator through a TI **DRV2605L** (`0x5A`) using its built-in ROM waveform
+  library (effect 1 Strong Click 100% for touch, effect 8 Soft Bump 60% ×2 with a
+  60 ms pause for the PIN prompt, and effect 14 Strong Buzz 100% held for 450 ms
+  for PIN rejection). Default bus pins are **GP14 (I2C1 SDA)** and **GP15 (I2C1
+  SCL)** at 400 kHz (`HAPTIC_I2C_SDA=14`, `HAPTIC_I2C_SCL=15`,
+  `HAPTIC_I2C_FREQ_HZ=400000`), leaving GP12/GP13 free for UART0 (e.g. an R503
+  fingerprint module). The I2C1 peripheral is wrapped in a static
+  `embassy_sync::mutex::Mutex<CriticalSectionRawMutex, I2c<'static, I2C1, Blocking>>`
+  (`haptic::SharedI2c1`) so a future I2C device (such as an RTC on GP14/GP15) can
+  share the bus safely. Select ERM (Library A, default) or LRA (Library F) via
+  `actuator = "erm" | "lra"` in `[haptic]` or `HAPTIC_ACTUATOR=erm|lra`:
+
+  | DRV2605L pin | RP2350-Zero | Notes |
+  |---|---|---|
+  | `VIN` / `GND` | 3V3 / GND | 3.3 V logic and motor supply |
+  | `SDA` | GP14 | I2C1 SDA (4.7 kΩ pull-up to 3V3; shared with future RTC) |
+  | `SCL` | GP15 | I2C1 SCL (4.7 kΩ pull-up to 3V3; shared with future RTC) |
+  | `EN` | 3V3 | tie high (or leave pulled up on breakout boards) |
+  | `OUT+` / `OUT-` | Actuator | ERM (`HAPTIC_ACTUATOR=erm`) or LRA (`HAPTIC_ACTUATOR=lra`) |
+
+  ```sh
+  # DRV2605L with ERM (default) or LRA actuator
+  env BOARD=waveshare-zero-ili9341-stacked HAPTIC_KIND=drv2605 \
+      cargo build --release -p firmware --features display
+  env BOARD=waveshare-zero-ili9341-stacked HAPTIC_KIND=drv2605 HAPTIC_ACTUATOR=lra \
+      cargo build --release -p firmware --features display
+  ```
+
+On-device haptic preferences (**Settings → Display → Haptics**) let you adjust
+runtime intensity (`Off` / `Low` / `Medium` / `High`), mute **PIN pad clicks** for
+acoustic side-channel privacy while keeping prompt and error cues active, and play
+a **Test cues** self-test sequence (persisted in `EF_DISPLAY`, `0xE030`).
+
+#### DS3231 I2C1 Real-Time Clock (On-Device TOTP)
+
+A **DS3231** battery-backed I2C real-time clock (`0x68`) can be wired to **GP14
+(I2C1 SDA)** and **GP15 (I2C1 SCL)** — sharing `I2C1` cleanly with the DRV2605L
+when `HAPTIC_KIND=drv2605` is used (`rtc::SharedI2c1`).
+
+| DS3231 pin | RP2350-Zero | Notes |
+|---|---|---|
+| `VCC` / `GND` | 3V3 / GND | plus CR2032 / LIR2032 backup cell on the DS3231 module |
+| `SDA` | GP14 | I2C1 SDA (shared with DRV2605L when present) |
+| `SCL` | GP15 | I2C1 SCL (shared with DRV2605L when present) |
+
+- **Time sync & Oscillator Stop Flag (`OSF`):** At boot (and when opening an OATH
+  credential), the firmware checks the DS3231 Status Register (`0x0F` bit 7, `OSF`)
+  and verifies the year is `>= 2025`. When the host syncs the device clock via the
+  rescue applet (`Platform::set_time`), the UTC timestamp is written to DS3231
+  registers `0x00..=0x06` in 24-hour BCD and `OSF` is cleared so time survives
+  unplugging.
+- **Live on-device TOTP:** Opening **Apps → OATH → `<account>`** computes the
+  credential's 6–8 digit RFC 6238 TOTP code on-device (`SHA-1`, `SHA-256`, or
+  `SHA-512`, custom period prefix) and refreshes the code and countdown once per
+  second. Credentials enrolled with `PROP_TOUCH` require a tap on the code card
+  (**"Tap to reveal code"**) before computing, and HOTP credentials stay read-only
+  so inspecting a detail screen never advances an HOTP counter.
+
 ## Enclosures
 
 A bare board works fine, but a printed case makes it pocketable. Four community
@@ -248,11 +360,3 @@ The two Printables designs as well as the Thingiverse design are licensed
 authors and keep any derivative under the same license. Check each MakerWorld
 page for the design license before you reuse the design. All are third-party
 designs, linked for convenience, not part of this project.
-
-## What the hardware does not give you
-
-The OTP fuses and secure boot ([production.md](production.md)) are real
-hardening, but the RP2350 is a general-purpose microcontroller, not a certified
-secure element. Physical attacks are out of scope: decapping, microprobing,
-fault injection beyond the on-chip glitch detectors, power/EM side channels.
-See the [threat model](threat-model.md) and [limitations](limitations.md).
